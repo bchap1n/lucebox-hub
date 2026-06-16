@@ -61,7 +61,11 @@ DaemonIO DaemonIO::with_token_callback(const TokenCallback & cb) const {
 // Default typed compress: delegates to handle_compress via temp file + DaemonIO collector.
 ModelBackend::CompressResult ModelBackend::compress(const CompressRequest & req) {
     CompressResult result;
-
+#if defined(_WIN32)
+    // PFlash temp-file compress not supported on Windows yet
+    (void)req;
+    return result;
+#else
     if (req.input_ids.empty()) return result;
 
     // Write input IDs to temp file (handle_compress reads from file)
@@ -100,6 +104,7 @@ ModelBackend::CompressResult ModelBackend::compress(const CompressRequest & req)
     result.ok = handle_compress(cmd, io) && !result.compressed_ids.empty();
     ::unlink(tmp_path);
     return result;
+#endif
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────

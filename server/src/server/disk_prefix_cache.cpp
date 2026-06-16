@@ -15,9 +15,21 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#if defined(_WIN32)
+// Disk prefix cache not supported on Windows — stub out
+#include <sys/stat.h>
+#include <direct.h>
+#define S_ISDIR(m) ((m) & _S_IFDIR)
+#define mkdir(path, mode) _mkdir(path)
+namespace { struct dirent { char d_name[256]; }; typedef void DIR; }
+static DIR* opendir(const char*) { return nullptr; }
+static dirent* readdir(DIR*) { return nullptr; }
+static int closedir(DIR*) { return 0; }
+#else
 #include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace dflash::common {
 

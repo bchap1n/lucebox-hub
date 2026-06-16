@@ -26,7 +26,11 @@
 #include <cstring>
 #include <fcntl.h>
 #include <sys/stat.h>
+#if defined(_WIN32)
+#include <io.h>
+#else
 #include <unistd.h>
+#endif
 
 #include "kv_quant.h"
 
@@ -86,6 +90,10 @@ static int dflash_min_tokens_floor() {
 }
 
 static FILE * open_dflash_floor_log() {
+#if defined(_WIN32)
+    // Floor log not supported on Windows — return null (non-critical debug feature)
+    return nullptr;
+#else
     static constexpr const char * kPath = "/tmp/dflash_floor.log";
     static constexpr off_t kMaxBytes = 1024 * 1024;
 
@@ -119,6 +127,7 @@ static FILE * open_dflash_floor_log() {
     FILE * out = fdopen(fd, "a");
     if (!out) ::close(fd);
     return out;
+#endif
 }
 }  // namespace
 
