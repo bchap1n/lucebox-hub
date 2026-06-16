@@ -23,7 +23,9 @@
 #include <string>
 #include <vector>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <cerrno>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -38,9 +40,36 @@ namespace {
 struct Gemma4Mmap {
     void *  addr = nullptr;
     size_t  len  = 0;
+#if defined(_WIN32)
+    HANDLE  hfile   = INVALID_HANDLE_VALUE;
+    HANDLE  hmap    = nullptr;
+#else
     int     fd   = -1;
+#endif
 
     bool open_ro(const std::string & path, std::string & err) {
+#if defined(_WIN32)
+        hfile = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hfile == INVALID_HANDLE_VALUE) {
+            err = "CreateFileA: " + path; return false;
+        }
+        LARGE_INTEGER sz;
+        if (!GetFileSizeEx(hfile, &sz)) {
+            err = "GetFileSizeEx"; CloseHandle(hfile); hfile = INVALID_HANDLE_VALUE; return false;
+        }
+        len = (size_t)sz.QuadPart;
+        hmap = CreateFileMappingW(hfile, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (!hmap) {
+            err = "CreateFileMappingW"; CloseHandle(hfile); hfile = INVALID_HANDLE_VALUE; return false;
+        }
+        addr = MapViewOfFile(hmap, FILE_MAP_READ, 0, 0, len);
+        if (!addr) {
+            err = "MapViewOfFile"; CloseHandle(hmap); CloseHandle(hfile);
+            hmap = nullptr; hfile = INVALID_HANDLE_VALUE; return false;
+        }
+        return true;
+#else
         fd = ::open(path.c_str(), O_RDONLY);
         if (fd < 0) { err = "open: " + path + " " + strerror(errno); return false; }
         struct stat st;
@@ -49,10 +78,17 @@ struct Gemma4Mmap {
         addr = ::mmap(nullptr, len, PROT_READ, MAP_PRIVATE, fd, 0);
         if (addr == MAP_FAILED) { err = "mmap"; addr = nullptr; ::close(fd); fd = -1; return false; }
         return true;
+#endif
     }
     void close_map() {
+#if defined(_WIN32)
+        if (addr)   { UnmapViewOfFile(addr); addr = nullptr; }
+        if (hmap)   { CloseHandle(hmap); hmap = nullptr; }
+        if (hfile != INVALID_HANDLE_VALUE) { CloseHandle(hfile); hfile = INVALID_HANDLE_VALUE; }
+#else
         if (addr) { ::munmap(addr, len); addr = nullptr; }
         if (fd >= 0) { ::close(fd); fd = -1; }
+#endif
     }
 };
 
@@ -387,7 +423,12 @@ bool load_gemma4_gguf_partial(const std::string & path,
     // Set up CPU embedder (keeps mmap alive)
     out.embedder.mmap_addr      = mmap.addr;
     out.embedder.mmap_len       = mmap.len;
+#if defined(_WIN32)
+    out.embedder.mmap_hfile     = mmap.hfile;
+    out.embedder.mmap_hmap      = mmap.hmap;
+#else
     out.embedder.mmap_fd        = mmap.fd;
+#endif
     out.embedder.tok_embd_bytes = (const uint8_t *)mmap.addr + tok_embd_off;
     out.embedder.tok_embd_type  = tok_embd_type;
     out.embedder.n_embd         = n_embd;
@@ -395,7 +436,12 @@ bool load_gemma4_gguf_partial(const std::string & path,
     out.embedder.row_bytes      = tok_embd_sz / (size_t)n_vocab;
     // Release mmap ownership to embedder (it will munmap on destruction)
     mmap.addr = nullptr;
+#if defined(_WIN32)
+    mmap.hfile = INVALID_HANDLE_VALUE;
+    mmap.hmap  = nullptr;
+#else
     mmap.fd   = -1;
+#endif
 
     // ── Assign tensors to struct ───────────────────────────────────────
     out.tok_embd = find_tensor(meta_ctx, "token_embd.weight");

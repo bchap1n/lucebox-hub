@@ -33,10 +33,14 @@
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#endif
 
 namespace dflash::common {
 
@@ -1926,6 +1930,19 @@ bool LagunaBackend::build_hybrid_storage_from_file(
     gguf_context * gctx = gguf_init_from_file(args_.target_path.c_str(), gip);
     if (!gctx) { err = "failed to re-open GGUF for expert loading"; return false; }
 
+#if defined(_WIN32)
+    HANDLE hfile = CreateFileA(args_.target_path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hfile == INVALID_HANDLE_VALUE) { gguf_free(gctx); err = "CreateFileA failed"; return false; }
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(hfile, &sz)) { CloseHandle(hfile); gguf_free(gctx); err = "GetFileSizeEx failed"; return false; }
+    const size_t file_size = (size_t)sz.QuadPart;
+    HANDLE hmap = CreateFileMappingW(hfile, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    CloseHandle(hfile);
+    if (!hmap) { gguf_free(gctx); err = "CreateFileMappingW failed"; return false; }
+    void * mmap_addr = MapViewOfFile(hmap, FILE_MAP_READ, 0, 0, file_size);
+    if (!mmap_addr) { CloseHandle(hmap); gguf_free(gctx); err = "MapViewOfFile failed"; return false; }
+#else
     int fd = ::open(args_.target_path.c_str(), O_RDONLY);
     if (fd < 0) { gguf_free(gctx); err = "open failed for mmap"; return false; }
     struct stat st;
@@ -1934,6 +1951,7 @@ bool LagunaBackend::build_hybrid_storage_from_file(
     void * mmap_addr = ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
     ::close(fd);
     if (mmap_addr == MAP_FAILED) { gguf_free(gctx); err = "mmap failed"; return false; }
+#endif
 
     const size_t data_start = gguf_get_data_offset(gctx);
     const auto * file_bytes = (const uint8_t *)mmap_addr;
@@ -1970,7 +1988,12 @@ bool LagunaBackend::build_hybrid_storage_from_file(
                                                             mmap_addr, file_size, *hybrid, &err, cache_slots);
     gguf_free(gctx);
     if (!ok) {
+#if defined(_WIN32)
+        UnmapViewOfFile(mmap_addr);
+        CloseHandle(hmap);
+#else
         ::munmap(mmap_addr, file_size);
+#endif
         return false;
     }
     // mmap ownership transferred to the storage (munmapped in ~MoeHybridStorage)
