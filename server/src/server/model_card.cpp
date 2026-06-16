@@ -13,7 +13,13 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#if defined(_WIN32)
+#include <windows.h>
+#define S_ISREG(m) ((m) & _S_IFREG)
+#define S_ISDIR(m) ((m) & _S_IFDIR)
+#else
 #include <unistd.h>
+#endif
 #include <sys/stat.h>
 
 namespace dflash::common {
@@ -42,11 +48,25 @@ std::string normalize_model_card_stem(const std::string & general_name) {
 }
 
 static bool file_exists(const std::string & path) {
+#if defined(_WIN32)
+    struct _stat st{};
+    return ::_stat(path.c_str(), &st) == 0 && (st.st_mode & _S_IFREG);
+#else
     struct stat st{};
     return ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+#endif
 }
 
 static std::string self_bin_dir() {
+#if defined(_WIN32)
+    char buf[MAX_PATH];
+    DWORD n = GetModuleFileNameA(nullptr, buf, sizeof(buf));
+    if (n == 0 || n >= sizeof(buf)) return {};
+    std::string path(buf, n);
+    auto slash = path.find_last_of("\\/");
+    if (slash == std::string::npos) return {};
+    return path.substr(0, slash);
+#else
     char buf[4096];
     ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
     if (n <= 0) return {};
@@ -55,6 +75,7 @@ static std::string self_bin_dir() {
     auto slash = path.find_last_of('/');
     if (slash == std::string::npos) return {};
     return path.substr(0, slash);
+#endif
 }
 
 // Find share/model_cards/ directory. Search order (spec §1 implementation note):

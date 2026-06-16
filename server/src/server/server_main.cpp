@@ -30,6 +30,13 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#if defined(_WIN32)
+// setenv polyfill for MSVC
+static inline int setenv(const char *name, const char *value, int overwrite) {
+    if (!overwrite) { const char *existing = std::getenv(name); if (existing) return 0; }
+    return _putenv_s(name, value);
+}
+#endif
 #include <cstring>
 #include <memory>
 #include <string>
