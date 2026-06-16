@@ -94,7 +94,32 @@ static inline void stream_emit_fd(int stream_fd, int32_t tok) {
 #endif
 }
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+static inline bool read_exact_fd(int fd, void * data, size_t bytes) {
+    char * p = (char *)data;
+    size_t done = 0;
+    HANDLE h = (HANDLE)(intptr_t)fd;
+    while (done < bytes) {
+        DWORD n = 0;
+        DWORD to_read = (bytes - done > (size_t)(DWORD)-1) ? (DWORD)-1 : (DWORD)(bytes - done);
+        if (!ReadFile(h, p + done, to_read, &n, nullptr) || n == 0) return false;
+        done += (size_t)n;
+    }
+    return true;
+}
+static inline bool write_exact_fd(int fd, const void * data, size_t bytes) {
+    const char * p = (const char *)data;
+    size_t done = 0;
+    HANDLE h = (HANDLE)(intptr_t)fd;
+    while (done < bytes) {
+        DWORD n = 0;
+        DWORD to_write = (bytes - done > (size_t)(DWORD)-1) ? (DWORD)-1 : (DWORD)(bytes - done);
+        if (!WriteFile(h, p + done, to_write, &n, nullptr) || n == 0) return false;
+        done += (size_t)n;
+    }
+    return true;
+}
+#else
 static inline bool read_exact_fd(int fd, void * data, size_t bytes) {
     char * p = (char *)data;
     size_t done = 0;

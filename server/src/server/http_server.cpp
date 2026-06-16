@@ -3,6 +3,15 @@
 // Core infrastructure: socket listen/accept, client threads, HTTP parsing,
 // job queue, worker thread with SSE streaming and disconnect detection.
 
+// winsock2.h MUST be first to avoid conflicts with windows.h
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
+
 #include "http_server.h"
 #include "admission.h"
 #include "sse_emitter.h"
@@ -27,6 +36,71 @@
 #include <fstream>
 #include <sstream>
 
+#if defined(_WIN32)
+#include <io.h>
+// Map POSIX socket APIs to Winsock (winsock2.h already included above)
+
+// fcntl stub: map nonblock set to ioctlsocket, get-flags just return 0
+static inline int _dflash_fcntl(int fd, int cmd, ...) {
+    if (cmd == 2 /* F_SETFL */) { u_long m = 1; return ioctlsocket((SOCKET)fd, FIONBIO, &m); }
+    return 0;
+}
+#define fcntl _dflash_fcntl
+#define F_GETFL 3
+#define F_SETFL 2
+#define O_NONBLOCK 0
+// setsockopt: POSIX uses int* for optval, Windows uses const char*
+static inline int _dflash_setsockopt(SOCKET s, int level, int optname, const int *optval, int optlen) {
+    return setsockopt(s, level, optname, (const char*)optval, optlen);
+}
+#define setsockopt(s, level, optname, optval, optlen) _dflash_setsockopt((SOCKET)(s), level, optname, optval, optlen)
+#define MSG_NOSIGNAL 0
+#define MSG_DONTWAIT 0
+#define EAGAIN   WSAEWOULDBLOCK
+#define EWOULDBLOCK  WSAEWOULDBLOCK
+using nfds_t = ULONG;
+#if !defined(socklen_t)
+using socklen_t = int;
+#endif
+#define SHUT_RDWR SD_BOTH
+#define SIGPIPE 0
+#define SIG_ERR nullptr
+#define SIG_IGN nullptr
+static inline auto _dflash_signal(int, ...) { return nullptr; }
+#define signal(sig, handler) _dflash_signal
+
+// Type mappings
+using ssize_t = int64_t;
+using pollfd = WSAPOLLFD;
+
+// errno → WSAGetLastError for socket errors
+#define socket_errno  WSAGetLastError()
+#define socket_strerror(e)  "winsock error"
+
+// usleep → Sleep
+#define usleep(us)  Sleep((us) / 1000)
+
+// fcntl O_NONBLOCK → ioctlsocket FIONBIO (wrap in helper)
+static inline int set_nonblock(int fd) {
+    u_long mode = 1;
+    return ioctlsocket((SOCKET)fd, FIONBIO, &mode);
+}
+
+// stat → _stat (Windows CRT)
+#define _stat32  _stat
+#define stat _stat32
+
+// readlink(/proc/self/exe) → GetModuleFileNameA
+static inline int win_readlink_exe(char * buf, int bufsz) {
+    DWORD len = GetModuleFileNameA(nullptr, buf, static_cast<DWORD>(bufsz));
+    if (len == 0 || len >= static_cast<DWORD>(bufsz)) return -1;
+    return static_cast<int>(len);
+}
+
+// poll → WSAPoll
+#define poll(fds, n, timeout) WSAPoll((WSAPOLLFD*)(fds), (ULONG)(n), (INT)(timeout))
+
+#else
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -36,6 +110,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace dflash::common {
 
@@ -761,7 +836,7 @@ static std::array<uint8_t, 16> compute_disk_cache_salt(const ServerConfig & cfg)
     struct stat st{};
     int64_t file_size  = 0;
     int64_t file_mtime = 0;
-    if (::stat(path.c_str(), &st) == 0) {
+    if (stat(path.c_str(), &st) == 0) {
         file_size  = (int64_t)st.st_size;
         file_mtime = (int64_t)st.st_mtime;
     } else {
@@ -826,14 +901,36 @@ std::string HttpServer::resolve_status_html() {
     if (const char * dir = std::getenv("DFLASH_SHARE_DIR")) {
         std::string path = std::string(dir) + "/status.html";
         struct stat st;
-        if (::stat(path.c_str(), &st) == 0) return path;
+        if (stat(path.c_str(), &st) == 0) return path;
     }
-    // 2. share/ relative to /proc/self/exe (build dir or installed prefix)
+    // 2. share/ relative to exe path (build dir or installed prefix)
     char exe_buf[1024] = {};
+#if defined(_WIN32)
+    ssize_t len = win_readlink_exe(exe_buf, sizeof(exe_buf) - 1);
+#else
     ssize_t len = ::readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
+#endif
     if (len > 0) {
         exe_buf[len] = '\0';
         std::string exe_dir(exe_buf);
+#if defined(_WIN32)
+        auto slash = exe_dir.rfind('\\');
+        if (slash != std::string::npos) {
+            exe_dir = exe_dir.substr(0, slash);
+            // 2a. <exe_dir>\share\status.html  (build directory layout)
+            {
+                std::string path = exe_dir + "\\share\\status.html";
+                struct stat st;
+                if (stat(path.c_str(), &st) == 0) return path;
+            }
+            // 2b. <exe_dir>\..\share\status.html  (installed prefix layout)
+            {
+                std::string path = exe_dir + "\\..\\share\\status.html";
+                struct stat st;
+                if (stat(path.c_str(), &st) == 0) return path;
+            }
+        }
+#else
         auto slash = exe_dir.rfind('/');
         if (slash != std::string::npos) {
             exe_dir = exe_dir.substr(0, slash);
@@ -850,11 +947,12 @@ std::string HttpServer::resolve_status_html() {
                 if (::stat(path.c_str(), &st) == 0) return path;
             }
         }
+#endif
     }
     // 3. ./share/status.html (development)
     {
         struct stat st;
-        if (::stat("share/status.html", &st) == 0) return "share/status.html";
+        if (stat("share/status.html", &st) == 0) return "share/status.html";
     }
     return {};
 }
@@ -873,7 +971,7 @@ static bool sse_try_send(int fd, const void * data, size_t len) {
         struct pollfd pfd = {fd, POLLOUT, 0};
         int ret;
         do {
-            ret = poll(&pfd, 1, static_cast<int>(std::min(remaining, (long)50)));
+            ret = poll(&pfd, 1, (remaining < 50) ? (int)remaining : 50);
         } while (ret < 0 && errno == EINTR);
         if (ret < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) return false;
         if (ret == 0) continue;
@@ -899,7 +997,7 @@ void HttpServer::broadcast_status() {
         }
     }
     for (int fd : dead) {
-        ::close(fd);
+        closesocket((SOCKET)(fd));
         sse_fds_.erase(std::remove(sse_fds_.begin(), sse_fds_.end(), fd),
                        sse_fds_.end());
     }
@@ -922,7 +1020,7 @@ void HttpServer::broadcast_token(const std::string & text) {
         }
     }
     for (int fd : dead) {
-        ::close(fd);
+        closesocket((SOCKET)(fd));
         sse_fds_.erase(std::remove(sse_fds_.begin(), sse_fds_.end(), fd),
                        sse_fds_.end());
     }
@@ -943,7 +1041,7 @@ void HttpServer::sse_heartbeat() {
         }
     }
     for (int fd : dead) {
-        ::close(fd);
+        closesocket((SOCKET)(fd));
         sse_fds_.erase(std::remove(sse_fds_.begin(), sse_fds_.end(), fd),
                        sse_fds_.end());
     }
@@ -960,8 +1058,11 @@ void HttpServer::shutdown() {
     // Signal worker and accept loop to stop.
     stopping_.store(true);
     queue_cv_.notify_all();
+#if defined(_WIN32)
+    WSACleanup();
+#endif
     if (listen_fd_ >= 0) {
-        ::close(listen_fd_);
+        closesocket((SOCKET)(listen_fd_));
         listen_fd_ = -1;
     }
     if (worker_thread_.joinable()) {
@@ -971,7 +1072,7 @@ void HttpServer::shutdown() {
     // Close SSE client connections.
     {
         std::lock_guard<std::mutex> lk(sse_mu_);
-        for (int fd : sse_fds_) ::close(fd);
+        for (int fd : sse_fds_) closesocket((SOCKET)(fd));
         sse_fds_.clear();
     }
 
@@ -1005,13 +1106,20 @@ void HttpServer::shutdown() {
 }
 
 int HttpServer::run() {
+#if defined(_WIN32)
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        std::fprintf(stderr, "[server] WSAStartup failed\n");
+        return 1;
+    }
+#endif
     // Ignore SIGPIPE so send() returns EPIPE instead of killing the process.
     signal(SIGPIPE, SIG_IGN);
 
     // Create listen socket.
     listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd_ < 0) {
-        std::fprintf(stderr, "[server] socket() failed: %s\n", strerror(errno));
+        std::fprintf(stderr, "[server] socket() failed: %s\n", socket_strerror(errno));
         return 1;
     }
 
@@ -1023,22 +1131,22 @@ int HttpServer::run() {
     sa.sin_port = htons((uint16_t)config_.port);
     if (inet_pton(AF_INET, config_.host.c_str(), &sa.sin_addr) != 1) {
         std::fprintf(stderr, "[server] invalid host address: %s\n", config_.host.c_str());
-        ::close(listen_fd_);
+        closesocket((SOCKET)(listen_fd_));
         listen_fd_ = -1;
         return 1;
     }
 
     if (bind(listen_fd_, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
         std::fprintf(stderr, "[server] bind(%s:%d) failed: %s\n",
-                     config_.host.c_str(), config_.port, strerror(errno));
-        ::close(listen_fd_);
+                     config_.host.c_str(), config_.port, socket_strerror(errno));
+        closesocket((SOCKET)(listen_fd_));
         listen_fd_ = -1;
         return 1;
     }
 
     if (listen(listen_fd_, 128) < 0) {
-        std::fprintf(stderr, "[server] listen() failed: %s\n", strerror(errno));
-        ::close(listen_fd_);
+        std::fprintf(stderr, "[server] listen() failed: %s\n", socket_strerror(errno));
+        closesocket((SOCKET)(listen_fd_));
         listen_fd_ = -1;
         return 1;
     }
@@ -1046,15 +1154,24 @@ int HttpServer::run() {
     // Non-blocking listen socket so the accept loop polls stopping_ on a short
     // timeout. This guarantees the loop exits on SIGTERM/SIGINT regardless of
     // which thread the signal handler runs on (it only sets the atomic flag).
+#if defined(_WIN32)
+    if (set_nonblock(listen_fd_) < 0) {
+        std::fprintf(stderr, "[server] set_nonblock failed: %s\n", socket_strerror(errno));
+        closesocket((SOCKET)(listen_fd_));
+        listen_fd_ = -1;
+        return 1;
+    }
+#else
     {
         int fl = fcntl(listen_fd_, F_GETFL, 0);
         if (fl < 0 || fcntl(listen_fd_, F_SETFL, fl | O_NONBLOCK) < 0) {
-            std::fprintf(stderr, "[server] fcntl(O_NONBLOCK) failed: %s\n", strerror(errno));
-            ::close(listen_fd_);
+            std::fprintf(stderr, "[server] fcntl(O_NONBLOCK) failed: %s\n", socket_strerror(errno));
+            closesocket((SOCKET)(listen_fd_));
             listen_fd_ = -1;
             return 1;
         }
     }
+#endif
 
     std::fprintf(stderr, "[server] listening on http://%s:%d\n",
                  config_.host.c_str(), config_.port);
@@ -1069,7 +1186,7 @@ int HttpServer::run() {
         if (pr <= 0) {
             // 0 = timeout (re-check stopping_); <0 with EINTR = signal. Both loop.
             if (pr < 0 && errno != EINTR) {
-                std::fprintf(stderr, "[server] poll() error: %s\n", strerror(errno));
+                std::fprintf(stderr, "[server] poll() error: %s\n", socket_strerror(errno));
             }
             continue;
         }
@@ -1080,7 +1197,7 @@ int HttpServer::run() {
         if (client_fd < 0) {
             if (stopping_.load()) break;
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
-            std::fprintf(stderr, "[server] accept() error: %s\n", strerror(errno));
+            std::fprintf(stderr, "[server] accept() error: %s\n", socket_strerror(errno));
             continue;
         }
 
@@ -1145,21 +1262,21 @@ void HttpServer::handle_client(int fd) {
     HttpRequest hr;
     if (!read_http_request(fd, hr)) {
         send_error(fd, 400, "bad HTTP request");
-        ::close(fd);
+        closesocket((SOCKET)(fd));
         return;
     }
 
     // CORS preflight.
     if (hr.method == "OPTIONS") {
         send_response(fd, 204, "", "");
-        ::close(fd);
+        closesocket((SOCKET)(fd));
         return;
     }
 
     // Health check.
     if (hr.method == "GET" && (hr.path == "/health" || hr.path == "/")) {
         send_response(fd, 200, "application/json", "{\"status\":\"ok\"}\n");
-        ::close(fd);
+        closesocket((SOCKET)(fd));
         return;
     }
 
@@ -1167,7 +1284,7 @@ void HttpServer::handle_client(int fd) {
     if (hr.method == "GET" && hr.path == "/props") {
         json body = build_props_body(config_, prefix_cache_, tool_memory_);
         send_response(fd, 200, "application/json", body.dump() + "\n");
-        ::close(fd);
+        closesocket((SOCKET)(fd));
         return;
     }
 
@@ -1176,19 +1293,19 @@ void HttpServer::handle_client(int fd) {
         if (status_html_path_.empty()) {
             send_error(fd, 404,
                 "status.html not found. Set DFLASH_SHARE_DIR or place it in share/status.html");
-            ::close(fd);
+            closesocket((SOCKET)(fd));
             return;
         }
         std::ifstream ifs(status_html_path_);
         if (!ifs.is_open()) {
             send_error(fd, 500, "failed to open status.html");
-            ::close(fd);
+            closesocket((SOCKET)(fd));
             return;
         }
         std::ostringstream oss;
         oss << ifs.rdbuf();
         send_response(fd, 200, "text/html; charset=utf-8", oss.str());
-        ::close(fd);
+        closesocket((SOCKET)(fd));
         return;
     }
 
@@ -1196,7 +1313,7 @@ void HttpServer::handle_client(int fd) {
     if (hr.method == "GET" && hr.path == "/status/json") {
         send_response(fd, 200, "application/json",
             status_.to_json().dump(-1, ' ', false, json::error_handler_t::replace) + "\n");
-        ::close(fd);
+        closesocket((SOCKET)(fd));
         return;
     }
 
@@ -1211,7 +1328,7 @@ void HttpServer::handle_client(int fd) {
             "Access-Control-Allow-Origin: *\r\n"
             "\r\n";
         if (!send_all(fd, headers, std::strlen(headers))) {
-            ::close(fd);
+            closesocket((SOCKET)(fd));
             return;
         }
         // Send initial state immediately.
@@ -1272,7 +1389,7 @@ void HttpServer::handle_client(int fd) {
                 })}
             };
             send_response(fd, 200, "application/json", codex_models.dump() + "\n");
-            ::close(fd);
+            closesocket((SOCKET)(fd));
             return;
         }
         json models = {
@@ -1287,7 +1404,7 @@ void HttpServer::handle_client(int fd) {
             })}
         };
         send_response(fd, 200, "application/json", models.dump() + "\n");
-        ::close(fd);
+        closesocket((SOCKET)(fd));
         return;
     }
 
@@ -1295,7 +1412,7 @@ void HttpServer::handle_client(int fd) {
     if (!route_request(fd, hr)) {
         send_error(fd, 404, "unknown endpoint");
     }
-    ::close(fd);
+    closesocket((SOCKET)(fd));
 }
 
 bool HttpServer::route_request(int fd, const HttpRequest & hr) {
@@ -3214,8 +3331,16 @@ bool HttpServer::read_http_request(int fd, HttpRequest & out) {
     ssize_t hend = -1;
     while (hend < 0 && buf.size() < 65536) {
         ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) return false;
+        if (n < 0) {
+#if defined(_WIN32)
+            int e = WSAGetLastError();
+            if (e == WSAEINTR || e == WSAEWOULDBLOCK) continue;
+#else
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+#endif
+            return false;
+        }
+        if (n == 0) return false;
         buf.append(tmp, n);
 
         // Look for end of headers.
@@ -3280,10 +3405,19 @@ bool HttpServer::read_http_request(int fd, HttpRequest & out) {
     // Read body.
     while ((ssize_t)buf.size() < hend + content_length) {
         ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) return false;
+        if (n < 0) {
+#if defined(_WIN32)
+            int e = WSAGetLastError();
+            if (e == WSAEINTR || e == WSAEWOULDBLOCK) continue;
+#else
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+#endif
+            return false;
+        }
+        if (n == 0) return false;
         buf.append(tmp, n);
     }
+    // Parse headers...
 
     out.body = buf.substr(hend, content_length);
     return true;
@@ -3304,14 +3438,24 @@ bool HttpServer::send_all(int fd, const void * data, size_t len) {
         int ret;
         do {
             ret = poll(&pfd, 1, timeout);
+#if defined(_WIN32)
+        } while (ret < 0 && WSAGetLastError() == WSAEINTR);
+#else
         } while (ret < 0 && errno == EINTR);
+#endif
         if (ret < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) return false;
         if (ret == 0) continue;  // poll timeout, retry until deadline
 
         ssize_t n = send(fd, p + sent, len - sent, MSG_NOSIGNAL);
         if (n < 0) {
+#if defined(_WIN32)
+            int e = WSAGetLastError();
+            if (e == WSAEINTR) continue;
+            if (e == WSAEWOULDBLOCK) continue;
+#else
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+#endif
             return false;  // EPIPE, ECONNRESET, etc.
         }
         sent += n;
