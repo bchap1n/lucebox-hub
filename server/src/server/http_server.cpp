@@ -56,7 +56,13 @@ static inline int _dflash_setsockopt(SOCKET s, int level, int optname, const int
 #define setsockopt(s, level, optname, optval, optlen) _dflash_setsockopt((SOCKET)(s), level, optname, optval, optlen)
 #define MSG_NOSIGNAL 0
 #define MSG_DONTWAIT 0
+#ifdef EAGAIN
+#undef EAGAIN
+#endif
 #define EAGAIN   WSAEWOULDBLOCK
+#ifdef EWOULDBLOCK
+#undef EWOULDBLOCK
+#endif
 #define EWOULDBLOCK  WSAEWOULDBLOCK
 using nfds_t = ULONG;
 #if !defined(socklen_t)
@@ -67,7 +73,7 @@ using socklen_t = int;
 #define SIG_ERR nullptr
 #define SIG_IGN nullptr
 static inline auto _dflash_signal(int, void*) { return nullptr; }
-#define signal(sig, handler) _dflash_signal
+#define signal(sig, handler) _dflash_signal(sig, handler)
 
 // Type mappings
 using ssize_t = int64_t;
@@ -75,9 +81,10 @@ using pollfd = WSAPOLLFD;
 
 // errno → WSAGetLastError for socket errors
 #define socket_errno  WSAGetLastError()
-static inline std::string socket_strerror(int e) {
-    (void)e;
-    return "winsock error " + std::to_string(e);
+static inline const char * socket_strerror(int e) {
+    thread_local static char buf[64];
+    std::snprintf(buf, sizeof(buf), "winsock error %d", e);
+    return buf;
 }
 
 // usleep → Sleep
@@ -91,6 +98,9 @@ static inline int set_nonblock(int fd) {
 
 // stat → _stat (Windows CRT) — all includes above, safe to redefine in this TU
 #define stat _stat
+
+// close → closesocket (squelch int→SOCKET narrowing warning)
+static inline int closesocket_fd(int fd) { return closesocket((SOCKET)(fd)); }
 
 // readlink(/proc/self/exe) → GetModuleFileNameA
 static inline int win_readlink_exe(char * buf, int bufsz) {
@@ -999,7 +1009,7 @@ void HttpServer::broadcast_status() {
         }
     }
     for (int fd : dead) {
-        closesocket((SOCKET)(fd));
+        closesocket_fd(fd);
         sse_fds_.erase(std::remove(sse_fds_.begin(), sse_fds_.end(), fd),
                        sse_fds_.end());
     }
@@ -1022,7 +1032,7 @@ void HttpServer::broadcast_token(const std::string & text) {
         }
     }
     for (int fd : dead) {
-        closesocket((SOCKET)(fd));
+        closesocket_fd(fd);
         sse_fds_.erase(std::remove(sse_fds_.begin(), sse_fds_.end(), fd),
                        sse_fds_.end());
     }
@@ -1043,7 +1053,7 @@ void HttpServer::sse_heartbeat() {
         }
     }
     for (int fd : dead) {
-        closesocket((SOCKET)(fd));
+        closesocket_fd(fd);
         sse_fds_.erase(std::remove(sse_fds_.begin(), sse_fds_.end(), fd),
                        sse_fds_.end());
     }
@@ -1064,7 +1074,7 @@ void HttpServer::shutdown() {
     WSACleanup();
 #endif
     if (listen_fd_ >= 0) {
-        closesocket((SOCKET)(listen_fd_));
+        closesocket_fd(listen_fd_);
         listen_fd_ = -1;
     }
     if (worker_thread_.joinable()) {
@@ -1074,7 +1084,7 @@ void HttpServer::shutdown() {
     // Close SSE client connections.
     {
         std::lock_guard<std::mutex> lk(sse_mu_);
-        for (int fd : sse_fds_) closesocket((SOCKET)(fd));
+        for (int fd : sse_fds_) closesocket_fd(fd);
         sse_fds_.clear();
     }
 
@@ -1133,7 +1143,7 @@ int HttpServer::run() {
     sa.sin_port = htons((uint16_t)config_.port);
     if (inet_pton(AF_INET, config_.host.c_str(), &sa.sin_addr) != 1) {
         std::fprintf(stderr, "[server] invalid host address: %s\n", config_.host.c_str());
-        closesocket((SOCKET)(listen_fd_));
+        closesocket_fd(listen_fd_);
         listen_fd_ = -1;
         return 1;
     }
@@ -1141,14 +1151,14 @@ int HttpServer::run() {
     if (bind(listen_fd_, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
         std::fprintf(stderr, "[server] bind(%s:%d) failed: %s\n",
                      config_.host.c_str(), config_.port, socket_strerror(errno));
-        closesocket((SOCKET)(listen_fd_));
+        closesocket_fd(listen_fd_);
         listen_fd_ = -1;
         return 1;
     }
 
     if (listen(listen_fd_, 128) < 0) {
         std::fprintf(stderr, "[server] listen() failed: %s\n", socket_strerror(errno));
-        closesocket((SOCKET)(listen_fd_));
+        closesocket_fd(listen_fd_);
         listen_fd_ = -1;
         return 1;
     }
@@ -1159,7 +1169,7 @@ int HttpServer::run() {
 #if defined(_WIN32)
     if (set_nonblock(listen_fd_) < 0) {
         std::fprintf(stderr, "[server] set_nonblock failed: %s\n", socket_strerror(errno));
-        closesocket((SOCKET)(listen_fd_));
+        closesocket_fd(listen_fd_);
         listen_fd_ = -1;
         return 1;
     }
@@ -1168,7 +1178,7 @@ int HttpServer::run() {
         int fl = fcntl(listen_fd_, F_GETFL, 0);
         if (fl < 0 || fcntl(listen_fd_, F_SETFL, fl | O_NONBLOCK) < 0) {
             std::fprintf(stderr, "[server] fcntl(O_NONBLOCK) failed: %s\n", socket_strerror(errno));
-            closesocket((SOCKET)(listen_fd_));
+            closesocket_fd(listen_fd_);
             listen_fd_ = -1;
             return 1;
         }
@@ -1264,21 +1274,21 @@ void HttpServer::handle_client(int fd) {
     HttpRequest hr;
     if (!read_http_request(fd, hr)) {
         send_error(fd, 400, "bad HTTP request");
-        closesocket((SOCKET)(fd));
+        closesocket_fd(fd);
         return;
     }
 
     // CORS preflight.
     if (hr.method == "OPTIONS") {
         send_response(fd, 204, "", "");
-        closesocket((SOCKET)(fd));
+        closesocket_fd(fd);
         return;
     }
 
     // Health check.
     if (hr.method == "GET" && (hr.path == "/health" || hr.path == "/")) {
         send_response(fd, 200, "application/json", "{\"status\":\"ok\"}\n");
-        closesocket((SOCKET)(fd));
+        closesocket_fd(fd);
         return;
     }
 
@@ -1286,7 +1296,7 @@ void HttpServer::handle_client(int fd) {
     if (hr.method == "GET" && hr.path == "/props") {
         json body = build_props_body(config_, prefix_cache_, tool_memory_);
         send_response(fd, 200, "application/json", body.dump() + "\n");
-        closesocket((SOCKET)(fd));
+        closesocket_fd(fd);
         return;
     }
 
@@ -1295,19 +1305,19 @@ void HttpServer::handle_client(int fd) {
         if (status_html_path_.empty()) {
             send_error(fd, 404,
                 "status.html not found. Set DFLASH_SHARE_DIR or place it in share/status.html");
-            closesocket((SOCKET)(fd));
+            closesocket_fd(fd);
             return;
         }
         std::ifstream ifs(status_html_path_);
         if (!ifs.is_open()) {
             send_error(fd, 500, "failed to open status.html");
-            closesocket((SOCKET)(fd));
+            closesocket_fd(fd);
             return;
         }
         std::ostringstream oss;
         oss << ifs.rdbuf();
         send_response(fd, 200, "text/html; charset=utf-8", oss.str());
-        closesocket((SOCKET)(fd));
+        closesocket_fd(fd);
         return;
     }
 
@@ -1315,7 +1325,7 @@ void HttpServer::handle_client(int fd) {
     if (hr.method == "GET" && hr.path == "/status/json") {
         send_response(fd, 200, "application/json",
             status_.to_json().dump(-1, ' ', false, json::error_handler_t::replace) + "\n");
-        closesocket((SOCKET)(fd));
+        closesocket_fd(fd);
         return;
     }
 
@@ -1330,7 +1340,7 @@ void HttpServer::handle_client(int fd) {
             "Access-Control-Allow-Origin: *\r\n"
             "\r\n";
         if (!send_all(fd, headers, std::strlen(headers))) {
-            closesocket((SOCKET)(fd));
+            closesocket_fd(fd);
             return;
         }
         // Send initial state immediately.
@@ -1391,7 +1401,7 @@ void HttpServer::handle_client(int fd) {
                 })}
             };
             send_response(fd, 200, "application/json", codex_models.dump() + "\n");
-            closesocket((SOCKET)(fd));
+            closesocket_fd(fd);
             return;
         }
         json models = {
@@ -1406,7 +1416,7 @@ void HttpServer::handle_client(int fd) {
             })}
         };
         send_response(fd, 200, "application/json", models.dump() + "\n");
-        closesocket((SOCKET)(fd));
+        closesocket_fd(fd);
         return;
     }
 
@@ -1414,7 +1424,7 @@ void HttpServer::handle_client(int fd) {
     if (!route_request(fd, hr)) {
         send_error(fd, 404, "unknown endpoint");
     }
-    closesocket((SOCKET)(fd));
+    closesocket_fd(fd);
 }
 
 bool HttpServer::route_request(int fd, const HttpRequest & hr) {
