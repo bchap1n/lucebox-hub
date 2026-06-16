@@ -358,10 +358,10 @@ bool load_target_gguf_partial(const std::string & path,
         gguf_free(gctx); return false;
     }
     if (n_layer % fai != 0) {
-        char buf[128];
-        std::snprintf(buf, sizeof(buf), "block_count=%u not divisible by full_attention_interval=%u", n_layer, fai);
-        set_last_error(buf);
-        gguf_free(gctx); return false;
+        // Qwen3.6-27B: 65 layers, fai=4 — last chunk is partial. Allowed.
+        std::fprintf(stderr, "[target load] note: block_count=%u not divisible by "
+                     "full_attention_interval=%u (allowed for Qwen3.6-style arch)\n",
+                     n_layer, fai);
     }
 
     // rope dimension_sections (array of 4 uint32)
