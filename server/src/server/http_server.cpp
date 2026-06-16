@@ -66,7 +66,7 @@ using socklen_t = int;
 #define SIGPIPE 0
 #define SIG_ERR nullptr
 #define SIG_IGN nullptr
-static inline auto _dflash_signal(int, ...) { return nullptr; }
+static inline auto _dflash_signal(int, void*) { return nullptr; }
 #define signal(sig, handler) _dflash_signal
 
 // Type mappings
@@ -75,7 +75,10 @@ using pollfd = WSAPOLLFD;
 
 // errno → WSAGetLastError for socket errors
 #define socket_errno  WSAGetLastError()
-#define socket_strerror(e)  "winsock error"
+static inline std::string socket_strerror(int e) {
+    (void)e;
+    return "winsock error " + std::to_string(e);
+}
 
 // usleep → Sleep
 #define usleep(us)  Sleep((us) / 1000)
@@ -86,9 +89,8 @@ static inline int set_nonblock(int fd) {
     return ioctlsocket((SOCKET)fd, FIONBIO, &mode);
 }
 
-// stat → _stat (Windows CRT)
-#define _stat32  _stat
-#define stat _stat32
+// stat → _stat (Windows CRT) — all includes above, safe to redefine in this TU
+#define stat _stat
 
 // readlink(/proc/self/exe) → GetModuleFileNameA
 static inline int win_readlink_exe(char * buf, int bufsz) {

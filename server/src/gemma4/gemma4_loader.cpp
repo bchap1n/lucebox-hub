@@ -51,22 +51,17 @@ struct Gemma4Mmap {
 #if defined(_WIN32)
         hfile = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
                             nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hfile == INVALID_HANDLE_VALUE) {
-            err = "CreateFileA: " + path; return false;
-        }
+        if (hfile == INVALID_HANDLE_VALUE) { err = "CreateFileA: " + path; return false; }
         LARGE_INTEGER sz;
-        if (!GetFileSizeEx(hfile, &sz)) {
-            err = "GetFileSizeEx"; CloseHandle(hfile); hfile = INVALID_HANDLE_VALUE; return false;
-        }
+        if (!GetFileSizeEx(hfile, &sz)) { err = "GetFileSizeEx"; CloseHandle(hfile); hfile = INVALID_HANDLE_VALUE; return false; }
         len = (size_t)sz.QuadPart;
         hmap = CreateFileMappingW(hfile, nullptr, PAGE_READONLY, 0, 0, nullptr);
-        if (!hmap) {
-            err = "CreateFileMappingW"; CloseHandle(hfile); hfile = INVALID_HANDLE_VALUE; return false;
-        }
+        if (!hmap) { err = "CreateFileMappingW"; CloseHandle(hfile); hfile = INVALID_HANDLE_VALUE; return false; }
         addr = MapViewOfFile(hmap, FILE_MAP_READ, 0, 0, len);
         if (!addr) {
             err = "MapViewOfFile"; CloseHandle(hmap); CloseHandle(hfile);
-            hmap = nullptr; hfile = INVALID_HANDLE_VALUE; return false;
+            hmap = nullptr; hfile = INVALID_HANDLE_VALUE;
+            return false;
         }
         return true;
 #else

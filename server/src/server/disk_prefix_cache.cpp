@@ -22,7 +22,11 @@
 #define S_ISDIR(m) ((m) & _S_IFDIR)
 #define mkdir(path, mode) _mkdir(path)
 namespace { struct dirent { char d_name[256]; }; typedef void DIR; }
-static DIR* opendir(const char*) { return nullptr; }
+static DIR* opendir(const char*) {
+    static bool once = false;
+    if (!once) { std::fprintf(stderr, "[disk-cache] not supported on Windows — disabled\n"); once = true; }
+    return nullptr;
+}
 static dirent* readdir(DIR*) { return nullptr; }
 static int closedir(DIR*) { return 0; }
 #else
