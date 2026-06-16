@@ -358,7 +358,12 @@ bool load_target_gguf_partial(const std::string & path,
         gguf_free(gctx); return false;
     }
     if (n_layer % fai != 0) {
-        // Qwen3.6-27B: 65 layers, fai=4 — last chunk is partial. Allowed.
+        // Some Qwen3.6 GGUF conversions (e.g. jackrong/Qwopus3.6-27B-Coder)
+        // set block_count=65 instead of 64. The 65th block is the output
+        // projection, not a real transformer layer — it has neither full-
+        // attention nor DeltaNet tensors. We truncate n_layer to the largest
+        // fai-multiple below so downstream graph builders see the correct
+        // layer count (64) and the sanity check loop skips the output block.
         std::fprintf(stderr, "[target load] note: block_count=%u not divisible by "
                      "full_attention_interval=%u (allowed for Qwen3.6-style arch)\n",
                      n_layer, fai);
@@ -426,6 +431,20 @@ bool load_target_gguf_partial(const std::string & path,
     out.ctx     = meta_ctx;
     out.backend = backend;
     out.n_layer = (int)n_layer;
+    // Qwen3.6 models with block_count=65: the 65th block is the output
+    // projection, not a transformer layer. It has neither attention nor
+    // DeltaNet tensors, so including it would cause the per-layer sanity
+    // check to fail ("layer 64 expected deltanet, missing tensors").
+    // Truncate to the largest full_attention_interval multiple so that
+    // n_layer reflects the actual number of transformer layers (64),
+    // matching the tensor names present in the file (blk.0 through blk.63).
+    if (out.n_layer % out.full_attention_interval != 0) {
+        std::fprintf(stderr, "[target load] truncating n_layer %d → %d (partial fai=%d group)\n",
+                     out.n_layer,
+                     (out.n_layer / out.full_attention_interval) * out.full_attention_interval,
+                     out.full_attention_interval);
+        out.n_layer = (out.n_layer / out.full_attention_interval) * out.full_attention_interval;
+    }
     out.n_embd  = (int)n_embd;
     out.n_ff    = (int)(n_ff ? n_ff : (n_ff_shexp ? n_ff_shexp : n_ff_exp));
     out.n_ff_exp = (int)n_ff_exp;
@@ -487,7 +506,7 @@ bool load_target_gguf_partial(const std::string & path,
     }
     out.n_vocab = (int)out.tok_embd->ne[1];
 
-    for (int il = 0; il < (int)n_layer; il++) {
+    for (int il = 0; il < out.n_layer; il++) {
         char name[128];
         auto fnd = [&](const char * suffix) -> ggml_tensor * {
             std::snprintf(name, sizeof(name), "blk.%d.%s", il, suffix);
@@ -554,6 +573,15 @@ bool load_target_gguf_partial(const std::string & path,
         const bool has_attn = L.wq && L.wk && L.wv && L.wo && L.q_norm && L.k_norm;
         const bool has_ssm  = L.wqkv && L.wqkv_gate && L.ssm_conv1d && L.ssm_out;
         const bool is_full_attn_layer = (((il + 1) % out.full_attention_interval) == 0);
+
+        // Defensive: if n_layer was not truncated above (e.g. a model whose
+        // block_count happens to match a different fai), the last block in a
+        // partial fai group is output-only — skip it rather than failing the
+        // "must have deltanet or full-attn" check.
+        if (il == out.n_layer - 1 && (out.n_layer % out.full_attention_interval) != 0) {
+            if (!has_attn && !has_ssm) continue;
+        }
+
         if (is_full_attn_layer && !has_attn) {
             char b[128];
             std::snprintf(b, sizeof(b), "layer %d expected full-attn, missing tensors", il);
@@ -697,7 +725,7 @@ bool load_target_gguf_partial(const std::string & path,
         };
 
         int n_scales = 0;
-        for (int il = 0; il < (int)n_layer; il++) {
+        for (int il = 0; il < out.n_layer; il++) {
             TargetLayer & L = out.layers[il];
             L.w_gate_s     = read_scale(il, "ffn_gate");
             L.w_up_s       = read_scale(il, "ffn_up");
