@@ -15,6 +15,11 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Windows: prevent min/max macros from clashing with std::min/std::max
+if(WIN32)
+    add_compile_definitions(NOMINMAX _CRT_SECURE_NO_WARNINGS)
+endif()
+
 # ── nlohmann/json (header-only, prefer system install, fallback to download) ──
 find_package(nlohmann_json CONFIG QUIET)
 if(NOT nlohmann_json_FOUND)
@@ -806,7 +811,11 @@ if(DFLASH27B_TESTS)
                 DFLASH27B_BACKEND_CUDA=1
                 DFLASH27B_CUDA_MIN_SM=${_dflash_cuda_min_sm})
         endif()
-        target_link_libraries(dflash_server PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} pthread)
+        if(WIN32)
+            target_link_libraries(dflash_server PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} ws2_32)
+        else()
+            target_link_libraries(dflash_server PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} pthread)
+        endif()
         if(CURL_FOUND)
             target_compile_definitions(dflash_server PRIVATE DFLASH_HAS_CURL=1)
             target_link_libraries(dflash_server PRIVATE CURL::libcurl)
