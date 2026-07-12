@@ -1,7 +1,3 @@
-[submodule "dflash/deps/llama.cpp"]
-	path = server/deps/llama.cpp
-	url = https://github.com/bchap1n/beellama.cpp.git
-	branch = lucebox-windows
 [submodule "dflash/deps/Block-Sparse-Attention"]
 	path = server/deps/Block-Sparse-Attention
 	url = https://github.com/mit-han-lab/Block-Sparse-Attention.git

@@ -3,10 +3,14 @@
 // Core infrastructure: socket listen/accept, client threads, HTTP parsing,
 // job queue, worker thread with SSE streaming and disconnect detection.
 
-// winsock2.h MUST be first to avoid conflicts with windows.h
+// On Windows, winsock2.h must be included BEFORE windows.h (which comes
+// transitively via internal.h → http_server.h). Classic MSVC ordering.
 #if defined(_WIN32)
-#ifndef NOMINMAX
+#if !defined(NOMINMAX)
 #define NOMINMAX
+#endif
+#if !defined(WIN32_LEAN_AND_MEAN)
+#define WIN32_LEAN_AND_MEAN
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -38,93 +42,71 @@
 
 #if defined(_WIN32)
 #include <io.h>
-// Map POSIX socket APIs to Winsock (winsock2.h already included above)
-
-// fcntl stub: map nonblock set to ioctlsocket, get-flags just return 0
-static inline int _dflash_fcntl(int fd, int cmd, ...) {
-    if (cmd == 2 /* F_SETFL */) { u_long m = 1; return ioctlsocket((SOCKET)fd, FIONBIO, &m); }
-    return 0;
-}
-#define fcntl _dflash_fcntl
-#define F_GETFL 3
-#define F_SETFL 2
-#define O_NONBLOCK 0
-// setsockopt: POSIX uses int* for optval, Windows uses const char*
-static inline int _dflash_setsockopt(SOCKET s, int level, int optname, const int *optval, int optlen) {
-    return setsockopt(s, level, optname, (const char*)optval, optlen);
-}
-#define setsockopt(s, level, optname, optval, optlen) _dflash_setsockopt((SOCKET)(s), level, optname, optval, optlen)
-#define MSG_NOSIGNAL 0
-#define MSG_DONTWAIT 0
-#ifdef EAGAIN
-#undef EAGAIN
-#endif
-#define EAGAIN   WSAEWOULDBLOCK
-#ifdef EWOULDBLOCK
-#undef EWOULDBLOCK
-#endif
-#define EWOULDBLOCK  WSAEWOULDBLOCK
-using nfds_t = ULONG;
-#if !defined(socklen_t)
-using socklen_t = int;
-#endif
-#define SHUT_RDWR SD_BOTH
-#define SIGPIPE 0
-#define SIG_ERR nullptr
-#define SIG_IGN nullptr
-static inline auto _dflash_signal(int, void*) { return nullptr; }
-#define signal(sig, handler) _dflash_signal(sig, handler)
-
-// Type mappings
-using ssize_t = int64_t;
-using pollfd = WSAPOLLFD;
-
-// errno → WSAGetLastError for socket errors
-#define socket_errno  WSAGetLastError()
-static inline const char * socket_strerror(int e) {
-    thread_local static char buf[64];
-    std::snprintf(buf, sizeof(buf), "winsock error %d", e);
+#include <sys/stat.h>
+typedef long ssize_t;
+#define MSG_NOSIGNAL   0
+#define MSG_DONTWAIT   0
+#define SHUT_RDWR      SD_BOTH
+#define socklen_t      int
+#define poll(fds,nfds,timeout)  WSAPoll(fds,nfds,timeout)
+#define SOCK_FD(fd)    ((SOCKET)(fd))
+// Replace fcntl(F_GETFL) / fcntl(F_SETFL, O_NONBLOCK) with ioctlsocket
+static inline int sock_get_flags(int fd) { (void)fd; return 0; /* stub */ }
+static inline void sock_set_nonblock(int fd) { u_long m = 1; ioctlsocket(SOCK_FD(fd), FIONBIO, &m); }
+static inline void sock_set_block(int fd) { u_long m = 0; ioctlsocket(SOCK_FD(fd), FIONBIO, &m); }
+static inline void socket_close(int fd) { closesocket(SOCK_FD(fd)); }
+#define SETSOCKOPT_CAST (const char *)
+static inline const char* sock_strerror() {
+    static thread_local char buf[64];
+    // On Windows, use FormatMessage for WSA errors
+    snprintf(buf, sizeof(buf), "WSA error %d", WSAGetLastError());
     return buf;
 }
-
-// usleep → Sleep
-#define usleep(us)  Sleep((us) / 1000)
-
-// fcntl O_NONBLOCK → ioctlsocket FIONBIO (wrap in helper)
-static inline int set_nonblock(int fd) {
-    u_long mode = 1;
-    return ioctlsocket((SOCKET)fd, FIONBIO, &mode);
-}
-
-// stat → _stat (Windows CRT) — all includes above, safe to redefine in this TU
-#define stat _stat
-
-// close → closesocket (squelch int→SOCKET narrowing warning)
-static inline int closesocket_fd(int fd) { return closesocket((SOCKET)(fd)); }
-
-// readlink(/proc/self/exe) → GetModuleFileNameA
-static inline int win_readlink_exe(char * buf, int bufsz) {
-    DWORD len = GetModuleFileNameA(nullptr, buf, static_cast<DWORD>(bufsz));
-    if (len == 0 || len >= static_cast<DWORD>(bufsz)) return -1;
-    return static_cast<int>(len);
-}
-
-// poll → WSAPoll
-#define poll(fds, n, timeout) WSAPoll((WSAPOLLFD*)(fds), (ULONG)(n), (INT)(timeout))
-
 #else
-#include <arpa/inet.h>
 #include <fcntl.h>
+#include <sys/stat.h>
+#define SOCK_FD(fd)    (fd)
+static inline int sock_get_flags(int fd) { return fcntl(fd, F_GETFL, 0); }
+static inline void sock_set_nonblock(int fd) { int f = fcntl(fd, F_GETFL, 0); if (f >= 0) fcntl(fd, F_SETFL, f | O_NONBLOCK); }
+static inline void sock_set_block(int fd) { int f = fcntl(fd, F_GETFL, 0); if (f >= 0) fcntl(fd, F_SETFL, f & ~O_NONBLOCK); }
+static inline void socket_close(int fd) { ::close(fd); }
+#define SETSOCKOPT_CAST  /* empty on POSIX */
+#include <unistd.h>
+static inline const char* sock_strerror() { return strerror(errno); }
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
 
 namespace dflash::common {
+
+static std::string context_overflow_message(int max_ctx, int prompt_tokens, int max_output) {
+    const int requested_tokens = prompt_tokens + max_output;
+    return "This model's maximum context length is " + std::to_string(max_ctx) +
+           " tokens. However, you requested " + std::to_string(requested_tokens) +
+           " tokens (" + std::to_string(prompt_tokens) + " in the messages, " +
+           std::to_string(max_output) +
+           " in the completion). Please reduce the length of the messages or completion.";
+}
+
+static bool prompt_ends_in_open_think(const std::string & prompt) {
+    static constexpr const char * kThinkOpen = "<think>";
+    static constexpr size_t kThinkOpenLen = 7;
+    size_t end = prompt.size();
+    while (end > 0) {
+        char c = prompt[end - 1];
+        if (c != ' ' && c != '\n' && c != '\r' && c != '\t') break;
+        --end;
+    }
+    return end >= kThinkOpenLen &&
+           prompt.compare(end - kThinkOpenLen, kThinkOpenLen, kThinkOpen) == 0;
+}
 
 // ─── piecewise keep-ratio curve ─────────────────────────────────────────
 
@@ -848,7 +830,7 @@ static std::array<uint8_t, 16> compute_disk_cache_salt(const ServerConfig & cfg)
     struct stat st{};
     int64_t file_size  = 0;
     int64_t file_mtime = 0;
-    if (stat(path.c_str(), &st) == 0) {
+    if (::stat(path.c_str(), &st) == 0) {
         file_size  = (int64_t)st.st_size;
         file_mtime = (int64_t)st.st_mtime;
     } else {
@@ -896,6 +878,7 @@ HttpServer::HttpServer(ModelBackend & backend,
     #ifdef DFLASH_HAS_CURL
     curl_global_init(CURL_GLOBAL_DEFAULT);
     #endif
+    prefix_cache_.init_full_cache(config.prefill_cache_cap);
     // Fold model+config identity into the layout fingerprint BEFORE init()
     // so compute_layout_id sees it on every learn/verify call. Prevents stale
     // KV hits when the server restarts over the same --kv-cache-dir with a
@@ -913,39 +896,30 @@ std::string HttpServer::resolve_status_html() {
     if (const char * dir = std::getenv("DFLASH_SHARE_DIR")) {
         std::string path = std::string(dir) + "/status.html";
         struct stat st;
-        if (stat(path.c_str(), &st) == 0) return path;
+        if (::stat(path.c_str(), &st) == 0) return path;
     }
     // 2. share/ relative to exe path (build dir or installed prefix)
-    char exe_buf[1024] = {};
+    {
+    std::string exe_dir;
 #if defined(_WIN32)
-    ssize_t len = win_readlink_exe(exe_buf, sizeof(exe_buf) - 1);
+    char exe_buf[MAX_PATH] = {};
+    DWORD n = GetModuleFileNameA(nullptr, exe_buf, sizeof(exe_buf));
+    if (n > 0 && n < sizeof(exe_buf)) {
+        exe_dir = std::string(exe_buf, n);
+        auto slash = exe_dir.find_last_of("/\\");
+        if (slash != std::string::npos) exe_dir = exe_dir.substr(0, slash);
+    }
 #else
+    char exe_buf[1024] = {};
     ssize_t len = ::readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
-#endif
     if (len > 0) {
         exe_buf[len] = '\0';
-        std::string exe_dir(exe_buf);
-#if defined(_WIN32)
-        auto slash = exe_dir.rfind('\\');
-        if (slash != std::string::npos) {
-            exe_dir = exe_dir.substr(0, slash);
-            // 2a. <exe_dir>\share\status.html  (build directory layout)
-            {
-                std::string path = exe_dir + "\\share\\status.html";
-                struct stat st;
-                if (stat(path.c_str(), &st) == 0) return path;
-            }
-            // 2b. <exe_dir>\..\share\status.html  (installed prefix layout)
-            {
-                std::string path = exe_dir + "\\..\\share\\status.html";
-                struct stat st;
-                if (stat(path.c_str(), &st) == 0) return path;
-            }
-        }
-#else
+        exe_dir = exe_buf;
         auto slash = exe_dir.rfind('/');
-        if (slash != std::string::npos) {
-            exe_dir = exe_dir.substr(0, slash);
+        if (slash != std::string::npos) exe_dir = exe_dir.substr(0, slash);
+    }
+#endif
+    if (!exe_dir.empty()) {
             // 2a. <exe_dir>/share/status.html  (build directory layout)
             {
                 std::string path = exe_dir + "/share/status.html";
@@ -959,12 +933,11 @@ std::string HttpServer::resolve_status_html() {
                 if (::stat(path.c_str(), &st) == 0) return path;
             }
         }
-#endif
     }
     // 3. ./share/status.html (development)
     {
         struct stat st;
-        if (stat("share/status.html", &st) == 0) return "share/status.html";
+        if (::stat("share/status.html", &st) == 0) return "share/status.html";
     }
     return {};
 }
@@ -980,10 +953,10 @@ static bool sse_try_send(int fd, const void * data, size_t len) {
             deadline - std::chrono::steady_clock::now()).count();
         if (remaining <= 0) return false;
 
-        struct pollfd pfd = {fd, POLLOUT, 0};
+        struct pollfd pfd = {SOCK_FD(fd), POLLOUT, 0};
         int ret;
         do {
-            ret = poll(&pfd, 1, (remaining < 50) ? (int)remaining : 50);
+            ret = poll(&pfd, 1, (int)(remaining < 50 ? remaining : 50));
         } while (ret < 0 && errno == EINTR);
         if (ret < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) return false;
         if (ret == 0) continue;
@@ -1009,7 +982,7 @@ void HttpServer::broadcast_status() {
         }
     }
     for (int fd : dead) {
-        closesocket_fd(fd);
+        socket_close(fd);
         sse_fds_.erase(std::remove(sse_fds_.begin(), sse_fds_.end(), fd),
                        sse_fds_.end());
     }
@@ -1032,7 +1005,7 @@ void HttpServer::broadcast_token(const std::string & text) {
         }
     }
     for (int fd : dead) {
-        closesocket_fd(fd);
+        socket_close(fd);
         sse_fds_.erase(std::remove(sse_fds_.begin(), sse_fds_.end(), fd),
                        sse_fds_.end());
     }
@@ -1053,7 +1026,7 @@ void HttpServer::sse_heartbeat() {
         }
     }
     for (int fd : dead) {
-        closesocket_fd(fd);
+        socket_close(fd);
         sse_fds_.erase(std::remove(sse_fds_.begin(), sse_fds_.end(), fd),
                        sse_fds_.end());
     }
@@ -1070,11 +1043,8 @@ void HttpServer::shutdown() {
     // Signal worker and accept loop to stop.
     stopping_.store(true);
     queue_cv_.notify_all();
-#if defined(_WIN32)
-    WSACleanup();
-#endif
     if (listen_fd_ >= 0) {
-        closesocket_fd(listen_fd_);
+        socket_close(listen_fd_);
         listen_fd_ = -1;
     }
     if (worker_thread_.joinable()) {
@@ -1084,7 +1054,7 @@ void HttpServer::shutdown() {
     // Close SSE client connections.
     {
         std::lock_guard<std::mutex> lk(sse_mu_);
-        for (int fd : sse_fds_) closesocket_fd(fd);
+        for (int fd : sse_fds_) socket_close(fd);
         sse_fds_.clear();
     }
 
@@ -1118,47 +1088,42 @@ void HttpServer::shutdown() {
 }
 
 int HttpServer::run() {
-#if defined(_WIN32)
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        std::fprintf(stderr, "[server] WSAStartup failed\n");
-        return 1;
-    }
-#endif
+#if !defined(_WIN32)
     // Ignore SIGPIPE so send() returns EPIPE instead of killing the process.
     signal(SIGPIPE, SIG_IGN);
+#endif
 
     // Create listen socket.
     listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd_ < 0) {
-        std::fprintf(stderr, "[server] socket() failed: %s\n", socket_strerror(errno));
+        std::fprintf(stderr, "[server] socket() failed: %s\n", sock_strerror());
         return 1;
     }
 
     int yes = 1;
-    setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    setsockopt(SOCK_FD(listen_fd_), SOL_SOCKET, SO_REUSEADDR, SETSOCKOPT_CAST &yes, sizeof(yes));
 
     struct sockaddr_in sa{};
     sa.sin_family = AF_INET;
     sa.sin_port = htons((uint16_t)config_.port);
     if (inet_pton(AF_INET, config_.host.c_str(), &sa.sin_addr) != 1) {
         std::fprintf(stderr, "[server] invalid host address: %s\n", config_.host.c_str());
-        closesocket_fd(listen_fd_);
+        socket_close(listen_fd_);
         listen_fd_ = -1;
         return 1;
     }
 
     if (bind(listen_fd_, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
         std::fprintf(stderr, "[server] bind(%s:%d) failed: %s\n",
-                     config_.host.c_str(), config_.port, socket_strerror(errno));
-        closesocket_fd(listen_fd_);
+                     config_.host.c_str(), config_.port, sock_strerror());
+        socket_close(listen_fd_);
         listen_fd_ = -1;
         return 1;
     }
 
     if (listen(listen_fd_, 128) < 0) {
-        std::fprintf(stderr, "[server] listen() failed: %s\n", socket_strerror(errno));
-        closesocket_fd(listen_fd_);
+        std::fprintf(stderr, "[server] listen() failed: %s\n", sock_strerror());
+        socket_close(listen_fd_);
         listen_fd_ = -1;
         return 1;
     }
@@ -1166,24 +1131,17 @@ int HttpServer::run() {
     // Non-blocking listen socket so the accept loop polls stopping_ on a short
     // timeout. This guarantees the loop exits on SIGTERM/SIGINT regardless of
     // which thread the signal handler runs on (it only sets the atomic flag).
-#if defined(_WIN32)
-    if (set_nonblock(listen_fd_) < 0) {
-        std::fprintf(stderr, "[server] set_nonblock failed: %s\n", socket_strerror(errno));
-        closesocket_fd(listen_fd_);
-        listen_fd_ = -1;
-        return 1;
-    }
-#else
     {
-        int fl = fcntl(listen_fd_, F_GETFL, 0);
-        if (fl < 0 || fcntl(listen_fd_, F_SETFL, fl | O_NONBLOCK) < 0) {
-            std::fprintf(stderr, "[server] fcntl(O_NONBLOCK) failed: %s\n", socket_strerror(errno));
-            closesocket_fd(listen_fd_);
+        int fl = sock_get_flags(listen_fd_);
+        if (fl < 0) { /* Windows: ioctlsocket sets non-block directly */ }
+        sock_set_nonblock(listen_fd_);
+        if (false) {
+            std::fprintf(stderr, "[server] fcntl(O_NONBLOCK) failed: %s\n", "n/a");
+            socket_close(listen_fd_);
             listen_fd_ = -1;
             return 1;
         }
     }
-#endif
 
     std::fprintf(stderr, "[server] listening on http://%s:%d\n",
                  config_.host.c_str(), config_.port);
@@ -1193,12 +1151,12 @@ int HttpServer::run() {
 
     // Accept loop.
     while (!stopping_.load()) {
-        struct pollfd pfd{listen_fd_, POLLIN, 0};
+        struct pollfd pfd{SOCK_FD(listen_fd_), POLLIN, 0};
         int pr = poll(&pfd, 1, 200 /* ms */);
         if (pr <= 0) {
             // 0 = timeout (re-check stopping_); <0 with EINTR = signal. Both loop.
             if (pr < 0 && errno != EINTR) {
-                std::fprintf(stderr, "[server] poll() error: %s\n", socket_strerror(errno));
+                std::fprintf(stderr, "[server] poll() error: %s\n", sock_strerror());
             }
             continue;
         }
@@ -1209,13 +1167,13 @@ int HttpServer::run() {
         if (client_fd < 0) {
             if (stopping_.load()) break;
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
-            std::fprintf(stderr, "[server] accept() error: %s\n", socket_strerror(errno));
+            std::fprintf(stderr, "[server] accept() error: %s\n", sock_strerror());
             continue;
         }
 
         // Disable Nagle for low-latency SSE streaming.
         int flag = 1;
-        setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+        setsockopt(SOCK_FD(client_fd), IPPROTO_TCP, TCP_NODELAY, SETSOCKOPT_CAST &flag, sizeof(flag));
 
         // Spawn client thread (detached — client_main owns the fd).
         active_clients_.fetch_add(1);
@@ -1274,21 +1232,21 @@ void HttpServer::handle_client(int fd) {
     HttpRequest hr;
     if (!read_http_request(fd, hr)) {
         send_error(fd, 400, "bad HTTP request");
-        closesocket_fd(fd);
+        socket_close(fd);
         return;
     }
 
     // CORS preflight.
     if (hr.method == "OPTIONS") {
         send_response(fd, 204, "", "");
-        closesocket_fd(fd);
+        socket_close(fd);
         return;
     }
 
     // Health check.
     if (hr.method == "GET" && (hr.path == "/health" || hr.path == "/")) {
         send_response(fd, 200, "application/json", "{\"status\":\"ok\"}\n");
-        closesocket_fd(fd);
+        socket_close(fd);
         return;
     }
 
@@ -1296,7 +1254,7 @@ void HttpServer::handle_client(int fd) {
     if (hr.method == "GET" && hr.path == "/props") {
         json body = build_props_body(config_, prefix_cache_, tool_memory_);
         send_response(fd, 200, "application/json", body.dump() + "\n");
-        closesocket_fd(fd);
+        socket_close(fd);
         return;
     }
 
@@ -1305,19 +1263,19 @@ void HttpServer::handle_client(int fd) {
         if (status_html_path_.empty()) {
             send_error(fd, 404,
                 "status.html not found. Set DFLASH_SHARE_DIR or place it in share/status.html");
-            closesocket_fd(fd);
+            socket_close(fd);
             return;
         }
         std::ifstream ifs(status_html_path_);
         if (!ifs.is_open()) {
             send_error(fd, 500, "failed to open status.html");
-            closesocket_fd(fd);
+            socket_close(fd);
             return;
         }
         std::ostringstream oss;
         oss << ifs.rdbuf();
         send_response(fd, 200, "text/html; charset=utf-8", oss.str());
-        closesocket_fd(fd);
+        socket_close(fd);
         return;
     }
 
@@ -1325,7 +1283,7 @@ void HttpServer::handle_client(int fd) {
     if (hr.method == "GET" && hr.path == "/status/json") {
         send_response(fd, 200, "application/json",
             status_.to_json().dump(-1, ' ', false, json::error_handler_t::replace) + "\n");
-        closesocket_fd(fd);
+        socket_close(fd);
         return;
     }
 
@@ -1340,7 +1298,7 @@ void HttpServer::handle_client(int fd) {
             "Access-Control-Allow-Origin: *\r\n"
             "\r\n";
         if (!send_all(fd, headers, std::strlen(headers))) {
-            closesocket_fd(fd);
+            socket_close(fd);
             return;
         }
         // Send initial state immediately.
@@ -1401,7 +1359,7 @@ void HttpServer::handle_client(int fd) {
                 })}
             };
             send_response(fd, 200, "application/json", codex_models.dump() + "\n");
-            closesocket_fd(fd);
+            socket_close(fd);
             return;
         }
         json models = {
@@ -1416,7 +1374,7 @@ void HttpServer::handle_client(int fd) {
             })}
         };
         send_response(fd, 200, "application/json", models.dump() + "\n");
-        closesocket_fd(fd);
+        socket_close(fd);
         return;
     }
 
@@ -1424,7 +1382,7 @@ void HttpServer::handle_client(int fd) {
     if (!route_request(fd, hr)) {
         send_error(fd, 404, "unknown endpoint");
     }
-    closesocket_fd(fd);
+    socket_close(fd);
 }
 
 bool HttpServer::route_request(int fd, const HttpRequest & hr) {
@@ -1611,28 +1569,45 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         int  effort_phase1_cap       = -1;  // from reasoning.effort lookup
         bool effort_set              = false;
 
+        auto apply_reasoning_effort = [&](const std::string & effort) {
+            if (effort == "none") {
+                enable_thinking = false;
+                return;
+            }
+
+            // Five-tier vocabulary (spec §4.2). Unknown → high.
+            int tier_value = config_.effort_tiers.high;
+            if      (effort == "minimal") tier_value = config_.effort_tiers.low;
+            else if (effort == "low")     tier_value = config_.effort_tiers.low;
+            else if (effort == "medium")  tier_value = config_.effort_tiers.medium;
+            else if (effort == "high")    tier_value = config_.effort_tiers.high;
+            else if (effort == "x-high")  tier_value = config_.effort_tiers.x_high;
+            else if (effort == "max")     tier_value = config_.effort_tiers.max;
+            // else: unknown tier → fall back to high (no error).
+
+            effort_phase1_cap = tier_value;
+            effort_set = true;
+            enable_thinking = true;
+            // Spec §4.2: reasoning effort activates the budget envelope.
+            req.thinking_opt_in = true;
+        };
+
         // OpenAI Responses API: "reasoning" field. Spec §4.2.
         if (body.contains("reasoning")) {
             auto & r = body["reasoning"];
             if (r.contains("effort")) {
-                std::string effort = r.value("effort", "high");
-                // Five-tier vocabulary (spec §4.2). Unknown → high.
-                int tier_value = config_.effort_tiers.high;
-                if      (effort == "low")    tier_value = config_.effort_tiers.low;
-                else if (effort == "medium") tier_value = config_.effort_tiers.medium;
-                else if (effort == "high")   tier_value = config_.effort_tiers.high;
-                else if (effort == "x-high") tier_value = config_.effort_tiers.x_high;
-                else if (effort == "max")    tier_value = config_.effort_tiers.max;
-                // else: unknown tier → fall back to high (no error).
-
-                effort_phase1_cap = tier_value;
-                effort_set = true;
-                enable_thinking = true;
-                // Spec §4.2: reasoning.effort activates the budget envelope.
-                req.thinking_opt_in = true;
+                apply_reasoning_effort(r.value("effort", "high"));
             } else {
                 enable_thinking = true;
             }
+        }
+        // OpenAI Chat Completions compatibility: some clients send a
+        // top-level reasoning_effort instead of Responses-style
+        // reasoning.effort. Treat it as the same tier selector unless the
+        // structured field already provided one.
+        if (!effort_set && body.contains("reasoning_effort") &&
+            body["reasoning_effort"].is_string()) {
+            apply_reasoning_effort(body["reasoning_effort"].get<std::string>());
         }
         // Anthropic-style: "thinking" field. Presence-as-opt-in: any
         // request that sends this field has opted in to the thinking-budget
@@ -1667,7 +1642,7 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         //   thinking.budget_tokens (if set) wins over reasoning.effort.
         //   Either is clamped to think_max_tokens.
         if (request_budget_tokens >= 0) {
-            int eff = std::min(request_budget_tokens, config_.think_max_tokens);
+            int eff = (std::min)(request_budget_tokens, config_.think_max_tokens);
             if (request_budget_tokens > config_.think_max_tokens) {
                 std::fprintf(stderr,
                     "[server] thinking.budget_tokens=%d clamped to "
@@ -1682,9 +1657,9 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
             // exceed default_max_tokens (e.g. Qwen3.6 max=81408 with
             // default=32768) — clients that want that full budget must pass
             // an explicit max_tokens. Otherwise we narrow silently to fit.
-            const int max_output_phase1_room = std::max(0,
+            const int max_output_phase1_room = (std::max)(0,
                 req.max_output - config_.hard_limit_reply_budget);
-            int eff = std::min(effort_phase1_cap, max_output_phase1_room);
+            int eff = (std::min)(effort_phase1_cap, max_output_phase1_room);
             if (effort_phase1_cap > max_output_phase1_room) {
                 // Info-level: this is normal when clients use a tier name but
                 // don't pass an explicit max_tokens. Not a warning.
@@ -1699,7 +1674,7 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         }
         // Reply budget:
         if (request_reply_budget >= 0) {
-            int eff = std::min(request_reply_budget, config_.hard_limit_reply_budget);
+            int eff = (std::min)(request_reply_budget, config_.hard_limit_reply_budget);
             if (request_reply_budget > config_.hard_limit_reply_budget) {
                 std::fprintf(stderr,
                     "[server] thinking.reply_budget=%d clamped to "
@@ -1755,6 +1730,7 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
                                             true, enable_thinking,
                                             tools_json);
         }
+        req.started_in_thinking = prompt_ends_in_open_think(rendered);
         req.prompt_tokens = tokenizer_.encode(rendered);
 
         // count_tokens: short-circuit after tokenization. Skip generation
@@ -1780,14 +1756,16 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
              n_prompt >= config_.pflash_threshold);
         if (should_reject_oversized(n_prompt, req.max_output,
                                     config_.max_ctx, pflash_will_run)) {
-            send_error(fd, 400, "prompt + max_tokens exceeds context window");
+            send_error(fd, 400,
+                       context_overflow_message(config_.max_ctx, n_prompt,
+                                                req.max_output));
             return true;
         }
     }
 
     std::fprintf(stderr,
         "[server] chat %s format=%s stream=%s msgs=%zu tools=%zu prompt_tokens=%zu "
-        "max_tokens=%d max_ctx=%d thinking=%s stops=%zu model=%s\n",
+        "max_tokens=%d max_ctx=%d thinking=%s started_in_thinking=%s stops=%zu model=%s\n",
         req.response_id.c_str(),
         api_format_name(req.format),
         req.stream ? "true" : "false",
@@ -1797,12 +1775,13 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         req.max_output,
         config_.max_ctx,
         req.thinking_enabled ? "true" : "false",
+        req.started_in_thinking ? "true" : "false",
         req.stop_sequences.size(),
         req.model.c_str());
 
     // Set socket non-blocking for send() stall detection during streaming.
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    int flags = sock_get_flags(fd);
+    if (flags >= 0) sock_set_nonblock(fd);
 
     // Enqueue job and wait for worker.
     ServerJob job;
@@ -1835,7 +1814,7 @@ void HttpServer::worker_loop() {
         std::string prompt_excerpt;
         if (!req.prompt_tokens.empty()) {
             // Decode first ~40 tokens as a prompt excerpt (cheap, bounded).
-            const int excerpt_len = std::min((int)req.prompt_tokens.size(), 40);
+            const int excerpt_len = (std::min)((int)req.prompt_tokens.size(), 40);
             std::vector<int32_t> excerpt_toks(req.prompt_tokens.begin(),
                                                req.prompt_tokens.begin() + excerpt_len);
             prompt_excerpt = tokenizer_.decode(excerpt_toks);
@@ -1903,7 +1882,8 @@ void HttpServer::worker_loop() {
         SseEmitter emitter(req.format, req.response_id, req.model,
                            (int)req.prompt_tokens.size(), req.tools,
                            &tool_memory_,
-                           req.stop_sequences);
+                           req.stop_sequences,
+                           req.started_in_thinking);
 
         // Emit initial SSE events (skip when proxying).
         if (req.stream && config_.pflash_upstream_base.empty()) {
@@ -1925,6 +1905,8 @@ void HttpServer::worker_loop() {
         bool pflash_compressed = false;
         // Compressed token count served from pFlash full-cache (-1 = not a full-cache hit).
         int pflash_full_cache_served_tokens = -1;
+        int full_cache_hit_slot = -1;
+        int full_cache_hit_len = 0;
 
         if (config_.pflash_mode != ServerConfig::PflashMode::OFF &&
             drafter_tokenizer_ != nullptr)
@@ -2171,8 +2153,12 @@ void HttpServer::worker_loop() {
                 if (full_slot >= 0) {
                     std::fprintf(stderr, "[pflash] full-cache hit slot=%d — skipping compress\n", full_slot);
                     pflash_compressed = true;
-                    // effective_prompt stays as req.prompt_tokens — the cached KV
-                    // state will be restored via cache_slot below.
+                    full_cache_hit_slot = full_slot;
+                    full_cache_hit_len = full_len;
+                    // Restore-only path: the prompt bytes are irrelevant as
+                    // long as restore_and_generate sees prompt_len == snap_pos
+                    // and therefore does not prefill a suffix.
+                    effective_prompt.assign((size_t)full_len, 0);
                     // Record the compressed size for the post-compress budget gate.
                     pflash_full_cache_served_tokens = full_len;
                 } else {
@@ -2266,7 +2252,7 @@ void HttpServer::worker_loop() {
                                         }
                                     }
                                 }
-                                float survival = (float)query_kept / std::max(1, (int)query_ids.size());
+                                float survival = (float)query_kept / (std::max)(1, (int)query_ids.size());
                                 std::fprintf(stderr, "[pflash] query survival: %d/%d (%.0f%%)\n",
                                              query_kept, (int)query_ids.size(), survival * 100.0f);
                                 if (survival < 0.80f && (int)query_ids.size() < 1000) {
@@ -2308,7 +2294,11 @@ void HttpServer::worker_loop() {
         if (effective_prompt_overflows((int)effective_prompt.size(),
                                        pflash_full_cache_served_tokens,
                                        req.max_output, config_.max_ctx)) {
-            fail_request(400, "effective prompt + max_tokens exceeds context window after compression");
+            const int prompt_len = pflash_full_cache_served_tokens >= 0
+                ? pflash_full_cache_served_tokens
+                : (int)effective_prompt.size();
+            fail_request(400, context_overflow_message(config_.max_ctx, prompt_len,
+                                                       req.max_output));
             continue;
         }
 
@@ -2393,7 +2383,7 @@ void HttpServer::worker_loop() {
             ? req.per_req_reply_budget
             : config_.hard_limit_reply_budget;
         const int n_gen_cap = budget_active
-            ? std::min(effective_think_ceiling + eff_reply_for_n_gen, req.max_output)
+            ? (std::min)(effective_think_ceiling + eff_reply_for_n_gen, req.max_output)
             : req.max_output;
 
         GenerateRequest gen_req;
@@ -2467,20 +2457,30 @@ void HttpServer::worker_loop() {
             gen_req.stall_skip_tokens = &stall_skip_tokens_storage;
         }
 
-        // Prefix cache: check for cached KV state.
-        auto [cache_slot, prefix_len] = prefix_cache_.lookup(effective_prompt);
+        // Full-prompt cache: exact raw-prompt hit skips most/all prefill.
+        int cache_slot = full_cache_hit_slot;
+        int prefix_len = full_cache_hit_len;
         bool using_restore = (cache_slot >= 0);
-
-        // Full-compress cache: if we compressed, check for cached KV.
-        if (pflash_compressed) {
+        if (!using_restore) {
             auto [full_slot, full_len] = prefix_cache_.lookup_full(req.prompt_tokens);
             if (full_slot >= 0) {
-                // Exact-match hit on the raw (uncompressed) prompt — skip compression.
                 cache_slot = full_slot;
                 prefix_len = full_len;
                 using_restore = true;
-                std::fprintf(stderr, "[pflash] full-cache hit slot=%d\n", full_slot);
+                if (pflash_compressed) {
+                    effective_prompt.assign((size_t)full_len, 0);
+                    gen_req.prompt = effective_prompt;
+                }
             }
+        }
+
+        // Inline prefix cache: check for cached turn-boundary KV state if no
+        // exact full-prompt cache was available.
+        if (!using_restore) {
+            auto [inline_slot, inline_len] = prefix_cache_.lookup(effective_prompt);
+            cache_slot = inline_slot;
+            prefix_len = inline_len;
+            using_restore = (cache_slot >= 0);
         }
 
         // Disk prefix cache: try disk if memory missed.
@@ -2612,7 +2612,7 @@ void HttpServer::worker_loop() {
                 DaemonIO scoped_io;
                 scoped_io.stream_fd = -1;
                 auto scoped_result = backend_.generate(scoped_req, scoped_io);
-                if (scoped_result.ok && backend_.snapshot_used(DISK_STAGING_SLOT)) {
+                if (scoped_result.ok() && backend_.snapshot_used(DISK_STAGING_SLOT)) {
                     disk_cache_.learn_layout(DISK_STAGING_SLOT);
                     const bool saved =
                         disk_cache_.save(DISK_STAGING_SLOT, scoped_req.prompt);
@@ -2668,7 +2668,7 @@ void HttpServer::worker_loop() {
                 DaemonIO cold_io;
                 cold_io.stream_fd = -1;
                 auto cold_result = backend_.generate(cold_req, cold_io);
-                if (cold_result.ok && backend_.snapshot_used(DISK_STAGING_SLOT)) {
+                if (cold_result.ok() && backend_.snapshot_used(DISK_STAGING_SLOT)) {
                     disk_cache_.learn_layout(DISK_STAGING_SLOT);
                     std::vector<int32_t> prefix_tokens(effective_prompt.begin(),
                                                        effective_prompt.begin() + cold_boundary);
@@ -2686,8 +2686,30 @@ void HttpServer::worker_loop() {
             }
         }
 
-        // Prepare inline snapshot for future cache hits.
-        auto [snap_slot, snap_cut] = prefix_cache_.prepare_inline_snap(effective_prompt);
+        // Prepare a full-prompt snapshot for exact prefill-cache hits.
+        int full_snap_slot = -1;
+        int full_snap_pos = 0;
+        bool full_snap_prepared = false;
+        if (!using_restore) {
+            full_snap_slot = prefix_cache_.prepare_full_snap(req.prompt_tokens);
+            if (full_snap_slot >= 0) {
+                full_snap_pos = (int)effective_prompt.size();
+                gen_req.snap_slot = full_snap_slot;
+                gen_req.snap_pos = full_snap_pos;
+                full_snap_prepared = true;
+            }
+        }
+
+        // Prepare inline snapshot for future cache hits. GenerateRequest only
+        // carries one snapshot target, so exact full-prompt cache takes
+        // priority when enabled.
+        int snap_slot = -1;
+        int snap_cut = 0;
+        if (!full_snap_prepared) {
+            auto prepared = prefix_cache_.prepare_inline_snap(effective_prompt);
+            snap_slot = prepared.first;
+            snap_cut = prepared.second;
+        }
         bool snap_prepared = (snap_slot >= 0);
         if (snap_prepared) {
             gen_req.snap_slot = snap_slot;
@@ -2697,7 +2719,7 @@ void HttpServer::worker_loop() {
         std::fprintf(stderr,
             "[server] chat CACHE %s restore=%s slot=%d prefix_len=%d "
             "effective_prompt=%zu pflash=%s disk_policy=%s disk_hit=%s "
-            "snap_slot=%d snap_pos=%d\n",
+            "snap_slot=%d snap_pos=%d full_snap_slot=%d full_snap_pos=%d\n",
             req.response_id.c_str(),
             using_restore ? "true" : "false",
             cache_slot,
@@ -2707,7 +2729,9 @@ void HttpServer::worker_loop() {
             disk_prefix_cache_policy_name(disk_policy).c_str(),
             disk_hit ? "true" : "false",
             snap_slot,
-            snap_cut);
+            snap_cut,
+            full_snap_slot,
+            full_snap_pos);
 
         // Update status page with cache/pflash/spec-decode flags.
         status_.set_flags(using_restore, pflash_compressed, !config_.draft_path.empty());
@@ -2872,6 +2896,22 @@ void HttpServer::worker_loop() {
         }
 
 
+        // Confirm or abort the full-prompt snapshot.
+        if (full_snap_prepared) {
+            if (completion_tokens > 0 && visible_output_seen && !client_disconnected &&
+                backend_.snapshot_used(full_snap_slot)) {
+                int saved_pos = backend_.snapshot_cur_pos(full_snap_slot);
+                if (saved_pos > 0) {
+                    prefix_cache_.confirm_full_snap(full_snap_slot, req.prompt_tokens,
+                                                    saved_pos);
+                } else {
+                    prefix_cache_.abort_full_snap(full_snap_slot);
+                }
+            } else {
+                prefix_cache_.abort_full_snap(full_snap_slot);
+            }
+        }
+
         // Confirm or abort the inline snapshot.
         if (snap_prepared) {
             if (completion_tokens > 0 && visible_output_seen && !client_disconnected &&
@@ -2900,7 +2940,7 @@ void HttpServer::worker_loop() {
         // Continued checkpoint: save if total tokens crossed an interval boundary.
         // This captures prompt + all generated tokens for long conversation reuse.
         if (!disk_cache_.disabled() && disk_policy.mode == DiskPrefixCacheMode::Full &&
-            result.ok && completion_tokens > 0 &&
+            result.ok() && completion_tokens > 0 &&
             visible_output_seen && !client_disconnected) {
             int final_pos = (int)effective_prompt.size() + (int)result.tokens.size();
             if (final_pos >= disk_cache_.continued_interval()) {
@@ -2930,16 +2970,6 @@ void HttpServer::worker_loop() {
             }
         }
 
-        // Full-compress cache: reserve + confirm after successful generation.
-        if (pflash_compressed && completion_tokens > 0 &&
-            visible_output_seen && !client_disconnected) {
-            int full_slot = prefix_cache_.prepare_full_snap(req.prompt_tokens);
-            if (full_slot >= 0) {
-                prefix_cache_.confirm_full_snap(full_slot, req.prompt_tokens,
-                                                (int)effective_prompt.size());
-            }
-        }
-
         // close_kind reflects the Level 2 BudgetHook outcome: "hard" when
         // the backend's AR/spec decode injected the close-token sequence
         // at the budget boundary, "natural" when the model self-closed
@@ -2958,7 +2988,7 @@ void HttpServer::worker_loop() {
         GenTimings gen_timings{ result.prefill_s, result.decode_s };
 
         // Record performance for /status page.
-        if (result.ok) {
+        if (result.ok()) {
             PerfRecord perf;
             perf.prompt_tokens = (int)req.prompt_tokens.size();
             perf.completion_tokens = completion_tokens;
@@ -2966,7 +2996,7 @@ void HttpServer::worker_loop() {
             // prefills the delta beyond the cached prefix, so dividing the full
             // prompt size by delta time would be wrong.
             const int prefill_tokens = using_restore
-                ? std::max(0, (int)effective_prompt.size() - prefix_len)
+                ? (std::max)(0, (int)effective_prompt.size() - prefix_len)
                 : (int)effective_prompt.size();
             perf.prefill_tok_s = (result.prefill_s > 0.0)
                 ? (double)prefill_tokens / result.prefill_s : 0.0;
@@ -3247,8 +3277,8 @@ void HttpServer::worker_loop() {
                 resp = {{"text", emitter.accumulated_text()}};
             }
             // Set socket back to blocking for the final send.
-            int flags = fcntl(fd, F_GETFL, 0);
-            if (flags >= 0) fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+            int flags = sock_get_flags(fd);
+            if (flags >= 0) sock_set_block(fd);
             send_response(fd, 200, "application/json", resp.dump() + "\n");
         }
 
@@ -3262,20 +3292,20 @@ void HttpServer::worker_loop() {
         const double elapsed_s =
             std::chrono::duration<double>(done_at - started_at).count();
         const int result_tokens = (int)result.tokens.size();
-        const int out_tokens = std::max(completion_tokens, result_tokens);
+        const int out_tokens = (std::max)(completion_tokens, result_tokens);
         const double tok_s = elapsed_s > 0.0 ? out_tokens / elapsed_s : 0.0;
         const double decode_tok_s =
             result.decode_s > 0.0 ? out_tokens / result.decode_s : 0.0;
         const std::string finish = client_disconnected
             ? "client_disconnect"
-            : (result.ok ? emitter.finish_reason() : "error");
+            : (result.ok() ? emitter.finish_reason() : "error");
 
         std::fprintf(stderr,
             "[server] chat DONE %s ok=%s in=%zu effective_in=%zu out=%d "
             "%.1fs %.1f tok/s finish=%s restore=%s slot=%d prefix_len=%d "
-            "prefill=%.1fs decode=%.1fs(%.1ftok/s) error=%s\n",
+            "prefill=%.1fs decode=%.1fs(%.1ftok/s) error=%s detail=%s\n",
             req.response_id.c_str(),
-            result.ok ? "true" : "false",
+            result.ok() ? "true" : "false",
             req.prompt_tokens.size(),
             effective_prompt.size(),
             out_tokens,
@@ -3288,7 +3318,8 @@ void HttpServer::worker_loop() {
             result.prefill_s,
             result.decode_s,
             decode_tok_s,
-            result.error.empty() ? "-" : result.error.c_str());
+            result.ok() ? "-" : result.error_code().data(),
+            result.error_detail().empty() ? "-" : result.error_detail().data());
 
         // Signal client thread that we're done.
         finish_job();
@@ -3343,16 +3374,8 @@ bool HttpServer::read_http_request(int fd, HttpRequest & out) {
     ssize_t hend = -1;
     while (hend < 0 && buf.size() < 65536) {
         ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
-        if (n < 0) {
-#if defined(_WIN32)
-            int e = WSAGetLastError();
-            if (e == WSAEINTR || e == WSAEWOULDBLOCK) continue;
-#else
-            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
-#endif
-            return false;
-        }
-        if (n == 0) return false;
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
         buf.append(tmp, n);
 
         // Look for end of headers.
@@ -3417,19 +3440,10 @@ bool HttpServer::read_http_request(int fd, HttpRequest & out) {
     // Read body.
     while ((ssize_t)buf.size() < hend + content_length) {
         ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
-        if (n < 0) {
-#if defined(_WIN32)
-            int e = WSAGetLastError();
-            if (e == WSAEINTR || e == WSAEWOULDBLOCK) continue;
-#else
-            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
-#endif
-            return false;
-        }
-        if (n == 0) return false;
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
         buf.append(tmp, n);
     }
-    // Parse headers...
 
     out.body = buf.substr(hend, content_length);
     return true;
@@ -3445,29 +3459,19 @@ bool HttpServer::send_all(int fd, const void * data, size_t len) {
             deadline - std::chrono::steady_clock::now()).count();
         if (remaining <= 0) return false;  // stall timeout
 
-        struct pollfd pfd = {fd, POLLOUT, 0};
+        struct pollfd pfd = {SOCK_FD(fd), POLLOUT, 0};
         int timeout = remaining > 50 ? 50 : (int)remaining;
         int ret;
         do {
             ret = poll(&pfd, 1, timeout);
-#if defined(_WIN32)
-        } while (ret < 0 && WSAGetLastError() == WSAEINTR);
-#else
         } while (ret < 0 && errno == EINTR);
-#endif
         if (ret < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) return false;
         if (ret == 0) continue;  // poll timeout, retry until deadline
 
         ssize_t n = send(fd, p + sent, len - sent, MSG_NOSIGNAL);
         if (n < 0) {
-#if defined(_WIN32)
-            int e = WSAGetLastError();
-            if (e == WSAEINTR) continue;
-            if (e == WSAEWOULDBLOCK) continue;
-#else
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-#endif
             return false;  // EPIPE, ECONNRESET, etc.
         }
         sent += n;

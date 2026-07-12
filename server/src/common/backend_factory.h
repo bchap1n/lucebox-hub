@@ -11,12 +11,14 @@
 #pragma once
 
 #include "model_backend.h"
+#include "internal.h"
 #include "placement/placement_config.h"
 #include "placement/remote_draft_config.h"
 #include "placement/remote_target_shard_config.h"
 
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace dflash::common {
 
@@ -48,12 +50,13 @@ struct BackendArgs {
     int             kq_stride_pad    = 32;
     int             draft_swa_window = 0;
     int             draft_ctx_max    = 4096;
-    bool            fast_rollback    = false;
+    bool            fast_rollback    = true;
     bool            seq_verify       = false;
     bool            ddtree_mode      = false;
     int             ddtree_budget    = 22;
     float           ddtree_temp      = 1.0f;
     bool            ddtree_chain_seed = true;
+    int             verify_width     = 0;  // chain spec verify width; 0 = adaptive
     bool            use_feature_mirror = false;
 };
 

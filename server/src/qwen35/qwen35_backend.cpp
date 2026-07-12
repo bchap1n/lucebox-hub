@@ -8,6 +8,10 @@
 #include "peer_access.h"
 #include "attn_masks.h"
 #include "common/sampler.h"
+#ifdef DFLASH27B_HAVE_GPU_SAMPLER
+#include "common/geometric_sampler_cuda.h"
+#include <random>
+#endif
 #include "common/io_utils.h"
 #include "common/restore_delta.h"
 #include "qwen3/qwen3_drafter.h"
@@ -23,12 +27,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#if !defined(_WIN32)
 #include <fcntl.h>
 #include <sys/stat.h>
-#if defined(_WIN32)
-#include <io.h>
-#else
 #include <unistd.h>
 #endif
 
@@ -91,8 +94,8 @@ static int dflash_min_tokens_floor() {
 
 static FILE * open_dflash_floor_log() {
 #if defined(_WIN32)
-    // Floor log not supported on Windows — return null (non-critical debug feature)
-    return nullptr;
+    // Simple append-mode log on Windows (no file size check).
+    return std::fopen("dflash_floor.log", "a");
 #else
     static constexpr const char * kPath = "/tmp/dflash_floor.log";
     static constexpr off_t kMaxBytes = 1024 * 1024;
@@ -149,6 +152,24 @@ static bool qwen35_empty_visible_output(const std::vector<int32_t> & tokens,
 Qwen35Backend::Qwen35Backend(const Qwen35Config & cfg) : cfg_(cfg) {}
 
 Qwen35Backend::~Qwen35Backend() { shutdown(); }
+
+// "auto" pool budget: device-free minus a reserve (compute buffers + drafter
+// when expected), converted at this model's pooled-KV density. Shared with MoE
+// placement so reservation and runtime allocation size the pool identically.
+KvFlashAutoBudget Qwen35Backend::make_kvflash_budget(const TargetWeights & w,
+                                                     int64_t gpu_free) const {
+    ggml_type kv_k = GGML_TYPE_Q8_0, kv_v = GGML_TYPE_Q8_0;
+    dflash::resolve_kv_types(kv_k, kv_v);
+    KvFlashAutoBudget b;
+    b.free_bytes      = gpu_free;
+    // Single source of truth with the qwen35moe placement path — see kv_quant.h.
+    b.bytes_per_token = (int64_t)dflash::kv_reservation_bytes_per_token(
+        w.n_layer, w.full_attention_interval, w.n_head_kv,
+        kv_k, w.n_embd_head_k, kv_v, w.n_embd_head_v);
+    b.reserve_bytes   = (int64_t)(1.5 * 1073741824.0) +
+        (kvflash_drafter_path_.empty() ? 0 : (int64_t)(1.7 * 1073741824.0));
+    return b;
+}
 
 // ── init() ──────────────────────────────────────────────────────────────
 
@@ -243,29 +264,20 @@ bool Qwen35Backend::init() {
     // point and the cache is not yet allocated, so device-free minus a
     // reserve (compute buffers + the drafter when expected) is what the
     // pool can really use, converted at this model's pooled-KV density.
-    KvFlashAutoBudget kvf_budget;
-    {
-        size_t gpu_free = 0, gpu_total = 0;
-        if (ggml_backend_dev_t dev = ggml_backend_get_device(target_backend_)) {
-            ggml_backend_dev_memory(dev, &gpu_free, &gpu_total);
-        }
-        ggml_type kv_k = GGML_TYPE_Q8_0, kv_v = GGML_TYPE_Q8_0;
-        dflash::resolve_kv_types(kv_k, kv_v);
-        const int n_full = w_.n_layer / w_.full_attention_interval;
-        kvf_budget.free_bytes      = (int64_t)gpu_free;
-        kvf_budget.bytes_per_token = (int64_t)n_full * w_.n_head_kv *
-            (int64_t)(ggml_row_size(kv_k, w_.n_embd_head_k) +
-                      ggml_row_size(kv_v, w_.n_embd_head_v));
-        kvf_budget.reserve_bytes   = (int64_t)(1.5 * 1073741824.0) +
-            (kvflash_drafter_path_.empty() ? 0 : (int64_t)(1.7 * 1073741824.0));
+    size_t gpu_free = 0, gpu_total = 0;
+    if (ggml_backend_dev_t dev = ggml_backend_get_device(target_backend_)) {
+        ggml_backend_dev_memory(dev, &gpu_free, &gpu_total);
     }
+    KvFlashAutoBudget kvf_budget = make_kvflash_budget(w_, (int64_t)gpu_free);
     kvflash_tokens_ = kvflash_pool_from_env(cfg_.device.max_ctx, KvFlashConfig{},
-                                            !kvflash_drafter_path_.empty() ||
-                                            kvflash_qk_policy_,
+                                            kvflash_scorer_expected(),
                                             kvf_budget);
     if (kvflash_tokens_ > 0) {
         kvflash_tau_ = std::max(1, env_int_or_default("DFLASH_KVFLASH_TAU", 64));
     }
+    // Subclass gate (e.g. MoE all-hot): may zero kvflash_tokens_ before the KV
+    // cache is sized, so create_target_cache allocates full max_ctx KV.
+    if (!post_kvflash_init_gate()) return false;
     if (!create_target_cache(w_, cfg_.device.max_ctx, max_verify_tokens, target_backend_, cache_,
                              /*prefill_only=*/true, /*ctx_alloc=*/kvflash_tokens_)) {
         std::fprintf(stderr, "cache: %s\n", dflash27b_last_error());
@@ -718,6 +730,7 @@ void Qwen35Backend::shutdown() {
     step_graph_destroy(draft_sg_);
     step_graph_destroy(proj_sg_);
     remote_draft_.close();
+    draft_kv_free(draft_kv_);
     draft_feature_mirror_free(feature_mirror_);
     for (int i = 0; i < PREFIX_SLOTS; i++) {
         free_prefix_snapshot(prefix_snapshots_[i]);
@@ -785,7 +798,7 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
     auto t_prefill_start = std::chrono::steady_clock::now();
     const int committed = do_prefill(req.prompt, out_io, req.snap_pos, req.snap_slot);
     if (committed < 0) {
-        result.error = "prefill";
+        result.fail(GenerateErrorCode::PrefillFailed);
         return result;
     }
     auto t_prefill_end = std::chrono::steady_clock::now();
@@ -823,14 +836,14 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
             }
         }
         if (!decode_ok) {
-            result.error = "decode";
+            result.fail(GenerateErrorCode::DecodeFailed);
             return result;
         }
         result.decode_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_decode_start).count();
     }
 
-    result.ok = true;
+    result.succeed();
     return result;
 }
 
@@ -842,7 +855,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);
     if (slot < 0 || slot >= PREFIX_SLOTS || !prefix_snapshots_[slot].ctx) {
-        result.error = "bad slot";
+        result.fail(GenerateErrorCode::InvalidSnapshotSlot);
         out_io.emit(-1);
         return result;
     }
@@ -893,7 +906,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         std::vector<int32_t> delta = restore_prompt_delta(req.prompt, snap_pos);
         committed = do_prefill(delta, out_io, req.snap_pos, req.snap_slot, /*kv_offset=*/snap_pos);
         if (committed < 0) {
-            result.error = "prefill";
+            result.fail(GenerateErrorCode::PrefillFailed);
             return result;
         }
         result.prefill_s = std::chrono::duration<double>(
@@ -911,11 +924,33 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         auto t_prefill_start = std::chrono::steady_clock::now();
         committed = do_prefill(req.prompt, out_io, req.snap_pos, req.snap_slot);
         if (committed < 0) {
-            result.error = "prefill";
+            result.fail(GenerateErrorCode::PrefillFailed);
             return result;
         }
         result.prefill_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_prefill_start).count();
+    } else {
+        // Exact full-prompt cache hit (prompt_len == snap_pos): no prefill ran,
+        // so the per-request decode step-graph sg_ was never (re)built. The
+        // first decode step (do_ar_decode / do_spec_decode) writes sg_.inp_embed
+        // BEFORE its own build_target_step, so a null/freed graph tensor aborts
+        // in ggml_backend_tensor_set. Build a single-token decode step graph at
+        // the restored position now, mirroring do_ar_decode's per-step build.
+        const bool pool = kvflash_active();
+        if (!build_target_step(sg_, w_, cache_, target_backend_,
+                               /*kv_start=*/cache_.cur_pos, /*n_tokens=*/1,
+                               /*with_mask=*/pool, /*capture=*/false,
+                               /*capture_delta_intermediate=*/false,
+                               /*fa_window=*/0,
+                               /*last_token_logits_only=*/false,
+                               cfg_.kq_stride_pad,
+                               should_capture_moe_router(),
+                               /*kvflash_mask=*/pool,
+                               /*capture_qk=*/pool && kvflash_qk_policy_)) {
+            result.fail(GenerateErrorCode::BackendSpecific,
+                             "restore step-graph build");
+            return result;
+        }
     }
 
     // Decode
@@ -950,14 +985,14 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
             }
         }
         if (!decode_ok) {
-            result.error = "decode";
+            result.fail(GenerateErrorCode::DecodeFailed);
             return result;
         }
         result.decode_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_decode_start).count();
     }
 
-    result.ok = true;
+    result.succeed();
     return result;
 }
 
@@ -1016,11 +1051,16 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     // already migrated when the snapshot was taken; re-running migrate would
     // clobber the restored state.
     if (kv_offset == 0) {
-        migrate_prefill_cache(w_, cfg_.device.max_ctx,
-                              cfg_.ddtree_mode
-                                  ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
-                                  : dw_.block_size,
-                              target_backend_, cache_);
+        const int max_verify_tokens = cfg_.ddtree_mode
+            ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
+            : dw_.block_size;
+        if (!migrate_prefill_cache(w_, cfg_.device.max_ctx,
+                                   max_verify_tokens,
+                                   target_backend_, cache_)) {
+            std::fprintf(stderr, "prefill: rollback cache migration failed: %s\n",
+                         dflash27b_last_error());
+            return -1;
+        }
     }
 
     // Chunked prefill
@@ -1553,10 +1593,44 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         }();
         int32_t next_tok;
         if (sampler_.needs_logit_processing()) {
-            ggml_backend_tensor_get(sg_.logits, logits_buf.data(), 0,
-                                    sizeof(float) * vocab);
-            next_tok = sample_logits(logits_buf.data(), vocab, sampler_,
-                                      out_tokens, sampler_rng_);
+#ifdef DFLASH27B_HAVE_GPU_SAMPLER
+            // GPU sample straight from the device logits tensor, skipping the
+            // full ~vocab-wide D2H copy (the same payoff DFLASH_GPU_ARGMAX gets
+            // for greedy). Falls back to the CPU chain on -1.
+            int g_tok = -1;
+            if (gpu_sampler_enabled() && gpu_sampler_supports(sampler_) &&
+                sg_.logits && sg_.logits->data) {
+                // Draw the uniform from a copy of the RNG so the real stream is
+                // not advanced yet; we only commit that single draw if the GPU
+                // path succeeds (below). On fallback the stream is untouched and
+                // sample_logits() draws the identical value it would with the
+                // GPU disabled, so the token stream is reproducible either way.
+                double r = 0.0;
+                if (sampler_.temp > 0.0f) {
+                    std::mt19937_64 rng_peek = sampler_rng_;
+                    std::uniform_real_distribution<double> u(0.0, 1.0);
+                    r = u(rng_peek);
+                }
+                g_tok = geometric_sample_logits_cuda(
+                    static_cast<const float *>(sg_.logits->data), vocab, sampler_,
+                    out_tokens, r, /*logits_on_device=*/true);
+            }
+            if (g_tok >= 0) {
+                // Commit the single uniform the GPU draw consumed, so the RNG
+                // advances by exactly one draw — matching the CPU/GPU-off path.
+                if (sampler_.temp > 0.0f) {
+                    std::uniform_real_distribution<double> u(0.0, 1.0);
+                    (void)u(sampler_rng_);
+                }
+                next_tok = g_tok;
+            } else
+#endif
+            {
+                ggml_backend_tensor_get(sg_.logits, logits_buf.data(), 0,
+                                        sizeof(float) * vocab);
+                next_tok = sample_logits(logits_buf.data(), vocab, sampler_,
+                                          out_tokens, sampler_rng_);
+            }
         } else if (kGpuArgmaxAR && sg_.argmax_tokens) {
             int32_t tok_i = 0;
             ggml_backend_tensor_get(sg_.argmax_tokens, &tok_i, 0, sizeof(int32_t));
@@ -1724,6 +1798,10 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                     bool * degenerate_close_out) {
     out_accept_rate = 0.0f;
     out_spec_ran    = false;
+    // [TAG_DRAFT_KV] the drafter ring persists across requests but its rows
+    // belong to the previous conversation; start every request empty (the
+    // first begin_step bulk-appends the live window from the feature mirror).
+    if (draft_kv_.gf) draft_kv_reset(draft_kv_);
     const int hidden = w_.n_embd;
 
     // First token: use the argmax that do_prefill already sampled and stored.
@@ -1734,10 +1812,33 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     // out-of-bounds tensor read.  cache_.last_tok is always correct.
     int32_t last_tok = cache_.last_tok;
 
+    // Sampled-verify: spec decode with an active sampler. Each chain
+    // position is verified against a token drawn from the target's own
+    // sampler chain instead of its argmax, so every committed token is an
+    // exact target sample — the output distribution is identical to AR
+    // sampling. Acceptance drops vs greedy but stays far above the AR
+    // floor. Opt in with DFLASH_SAMPLED_VERIFY=1; without it, sampling
+    // requests fall back to AR decode (zero behavior change by default).
+    static const bool kSampledVerify = []() {
+        const char * e = std::getenv("DFLASH_SAMPLED_VERIFY");
+        return e != nullptr && std::string(e) == "1";
+    }();
+    // Sampled-verify additionally requires full attention in the verify
+    // path. With a finite --fa-window the verify batch applies one
+    // window-start to the whole batch (unlike the AR step graph, which is
+    // hardcoded to full attention): the argmax stays robust, so greedy
+    // verification is unaffected, but the logit TAIL drifts at long
+    // context and top-k sampling draws degenerate tokens from it
+    // (reproduced at 24K: 0/12 tool calls with fa-window 2048, 4/4 with 0).
+    const bool sampled_verify = kSampledVerify &&
+        sampler_.needs_logit_processing() &&
+        cfg_.fa_window == 0;
+
     // Check if we can use speculative decode:
     // - draft model loaded and not parked
     // - feature mirror initialized
     // - greedy decoding (no logit processing) — spec decode uses argmax verification
+    // - sampled-verify enabled — allows spec decode with active sampling
     // - kvflash: verify_batch is slot-mapped (Qwen35DFlashTarget pooled
     //   path), and that covers --ddtree too: in the daemon, ddtree_mode
     //   configures larger verify intermediates + fast_rollback, whose
@@ -1749,7 +1850,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         && (cfg_.remote_draft.enabled()
             ? remote_draft_.active()
             : feature_mirror_.target_feat != nullptr)
-        && !sampler_.needs_logit_processing();
+        && (!sampler_.needs_logit_processing() || sampled_verify);
 
     if (!can_spec) {
         // AR fallback consumes the final prefill position itself, then advances
@@ -1763,6 +1864,31 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     }
 
     out_spec_ran = true;
+
+    // Sampled-verify: cache_.last_tok is do_prefill's argmax, and the spec
+    // loop commits it verbatim as the first generated token. The first token
+    // is the highest-entropy decision of the whole generation (e.g. "answer
+    // with text" vs "open a tool call"), so it must be sampled like every
+    // other committed token — mirror do_ar_decode's first-token sampling.
+    if (sampled_verify && out_tokens.empty() && prefill_last_logits_valid_) {
+        std::vector<float> first_logits(w_.n_vocab);
+        ggml_backend_tensor_get(sg_.logits, first_logits.data(),
+                                prefill_last_logits_offset_,
+                                sizeof(float) * (size_t)w_.n_vocab);
+        if (std::getenv("DFLASH_SV_DEBUG")) {
+            int am = 0; float best = first_logits[0];
+            for (int v = 1; v < w_.n_vocab; v++)
+                if (first_logits[v] > best) { best = first_logits[v]; am = v; }
+            std::fprintf(stderr,
+                "[sv-debug] first-token: logits_argmax=%d cache_last_tok=%d "
+                "(match=%d) top_logit=%.3f\n",
+                am, cache_.last_tok, am == cache_.last_tok, best);
+        }
+        last_tok = sample_logits(first_logits.data(), w_.n_vocab, sampler_,
+                                 out_tokens, sampler_rng_);
+        cache_.last_tok = last_tok;
+    }
+
     const int _min_floor = dflash_min_tokens_floor();
 
     // ── DFlash spec-decode: draft → verify → accept → replay ──────────
@@ -1770,6 +1896,18 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     DFlashTarget * target = dflash_target();
     const bool use_remote_draft = cfg_.remote_draft.enabled() && remote_draft_.active();
     const int q_len = dw_.block_size > 0 ? dw_.block_size : DFLASH27B_DRAFT_BLOCK_SIZE;
+    const int max_verify_tokens = cfg_.ddtree_mode
+        ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
+        : dw_.block_size;
+    if ((cfg_.fast_rollback || cfg_.ddtree_mode) && !cache_.rollback_ctx) {
+        if (!migrate_prefill_cache(w_, cfg_.device.max_ctx,
+                                   max_verify_tokens,
+                                   target_backend_, cache_)) {
+            std::fprintf(stderr, "spec-decode: rollback cache migration failed: %s\n",
+                         dflash27b_last_error());
+            return false;
+        }
+    }
 
     StepGraph draft_sg;
 
@@ -1777,6 +1915,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     std::vector<int32_t> noise_ids(q_len);
     std::vector<int32_t> draft_tok(q_len);
     std::vector<int32_t> target_tok(q_len);
+    std::vector<float>   verify_logits;   // sampled-verify: [q_len x vocab]
+    std::vector<int32_t> verify_history;  // sampled-verify: penalty history
     std::vector<int32_t> pos_q(q_len);
     std::vector<int32_t> pos_k;
     std::vector<float>   local_hidden;
@@ -1786,6 +1926,23 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     int n_accept_sum    = 0;
     int n_hint_proposed = 0;
     int n_hint_accepted = 0;
+    int target_forwards = 0;
+
+    auto log_target_forward_stats = [&]() {
+        std::fprintf(stderr, "[spec-decode] target_forwards=%d forwards_per_token=%.6f forwards_per_step=%.3f\n",
+                     target_forwards,
+                     n_generated > 0 ? (double)target_forwards / n_generated : 0.0,
+                     n_draft_steps > 0 ? (double)target_forwards / n_draft_steps : 0.0);
+    };
+
+    // kvflash: an in-pool prompt prefills contiguously without registering
+    // chunks in the pager. Map the prefix now so the pager stays consistent
+    // with the tree path's direct writes and hands off cleanly to slot-mapped
+    // paging once the context outgrows the pool. (A >pool prompt already paged
+    // during prefill, leaving the pager non-identity, so this is skipped.)
+    if (kvflash_active() && kvflash_pager_.is_identity()) {
+        (void)kvflash_pager_.alloc_span(0, committed);
+    }
 
     auto t_dec0 = std::chrono::steady_clock::now();
 
@@ -1806,6 +1963,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             cache_.last_tok = out_tokens.back();
             const int ar_n_gen = n_gen - n_generated;
             if (ar_n_gen <= 0) {
+                log_target_forward_stats();
                 io.emit(-1);
                 return true;
             }
@@ -1813,6 +1971,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
                                     tail_hook, forced_close_out,
                                     degenerate_close_out);
+            log_target_forward_stats();
             io.emit(-1);
             return ok;
         }
@@ -1846,42 +2005,83 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 return false;
             }
         } else {
-            if (!build_draft_step(draft_sg, dw_, /*lm_head=*/nullptr, draft_backend_,
-                                  draft_ctx, use_mirror_view ? &feature_mirror_ : nullptr,
-                                  committed,
-                                  /*ctx_len_max=*/std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max)))) {
-                std::fprintf(stderr, "spec-decode: draft build failed\n");
-                step_graph_destroy(draft_sg);
-                return false;
+            // [TAG_DRAFT_KV] ring-cached drafter context KV: append newly
+            // committed rows instead of re-encoding the whole feature window.
+            static const bool draft_kv_on = []() {
+                const char * e = std::getenv("DFLASH_DRAFT_KV");
+                return !(e && e[0] == '0' && e[1] == '\0');
+            }();
+            bool use_draft_kv = draft_kv_on && feature_mirror_.target_feat != nullptr;
+            if (use_draft_kv && draft_kv_.gf &&
+                draft_kv_.built_for != (const void *)&dw_) {
+                draft_kv_free(draft_kv_);
             }
-            if (!use_mirror_view &&
-                !copy_feature_ring_range_to_tensor(feature_mirror_, draft_sg.target_hidden_cat,
-                                                   draft_start, draft_ctx)) {
-                std::fprintf(stderr, "spec-decode: feature copy failed\n");
-                step_graph_destroy(draft_sg);
-                return false;
+            if (use_draft_kv && !draft_kv_.gf) {
+                const int kv_cap = std::min(ring_cap,
+                    std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max));
+                if (!draft_kv_init(draft_kv_, dw_, draft_backend_, kv_cap, nullptr)) {
+                    draft_kv_free(draft_kv_);
+                    use_draft_kv = false;
+                    std::fprintf(stderr,
+                        "spec-decode: draft-kv init failed; using legacy draft path\n");
+                }
             }
-            ggml_backend_tensor_set(draft_sg.inp_embed, noise_embed.data(), 0,
-                                    sizeof(float) * noise_embed.size());
-            pos_k.resize((size_t)draft_ctx + q_len);
-            for (int i = 0; i < q_len; i++) pos_q[i] = draft_ctx + i;
-            for (int i = 0; i < draft_ctx + q_len; i++) pos_k[i] = i;
-            ggml_backend_tensor_set(draft_sg.positions, pos_q.data(), 0,
-                                    sizeof(int32_t) * pos_q.size());
-            ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
-                                    sizeof(int32_t) * pos_k.size());
+            if (use_draft_kv) {
+                if (!draft_kv_begin_step(draft_kv_, dw_, draft_backend_,
+                                         feature_mirror_, committed)) {
+                    std::fprintf(stderr, "spec-decode: draft-kv step prep failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                ggml_backend_tensor_set(draft_kv_.inp_embed, noise_embed.data(), 0,
+                                        sizeof(float) * noise_embed.size());
+                if (ggml_backend_graph_compute(draft_backend_, draft_kv_.gf) !=
+                    GGML_STATUS_SUCCESS) {
+                    std::fprintf(stderr, "spec-decode: draft-kv compute failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                local_hidden.resize((size_t)hidden * q_len);
+                ggml_backend_tensor_get(draft_kv_.hidden_states, local_hidden.data(), 0,
+                                        sizeof(float) * local_hidden.size());
+            } else {
+                if (!build_draft_step(draft_sg, dw_, /*lm_head=*/nullptr, draft_backend_,
+                                      draft_ctx, use_mirror_view ? &feature_mirror_ : nullptr,
+                                      committed,
+                                      /*ctx_len_max=*/std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max)))) {
+                    std::fprintf(stderr, "spec-decode: draft build failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                if (!use_mirror_view &&
+                    !copy_feature_ring_range_to_tensor(feature_mirror_, draft_sg.target_hidden_cat,
+                                                       draft_start, draft_ctx)) {
+                    std::fprintf(stderr, "spec-decode: feature copy failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                ggml_backend_tensor_set(draft_sg.inp_embed, noise_embed.data(), 0,
+                                        sizeof(float) * noise_embed.size());
+                pos_k.resize((size_t)draft_ctx + q_len);
+                for (int i = 0; i < q_len; i++) pos_q[i] = draft_ctx + i;
+                for (int i = 0; i < draft_ctx + q_len; i++) pos_k[i] = i;
+                ggml_backend_tensor_set(draft_sg.positions, pos_q.data(), 0,
+                                        sizeof(int32_t) * pos_q.size());
+                ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
+                                        sizeof(int32_t) * pos_k.size());
 
-            auto st = ggml_backend_graph_compute(draft_backend_, draft_sg.gf);
-            if (st != GGML_STATUS_SUCCESS) {
-                std::fprintf(stderr, "spec-decode: draft compute failed\n");
-                step_graph_destroy(draft_sg);
-                return false;
-            }
+                auto st = ggml_backend_graph_compute(draft_backend_, draft_sg.gf);
+                if (st != GGML_STATUS_SUCCESS) {
+                    std::fprintf(stderr, "spec-decode: draft compute failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
 
-            // Read draft hidden states to host for LM-head projection.
-            local_hidden.resize((size_t)hidden * q_len);
-            ggml_backend_tensor_get(draft_sg.hidden_states, local_hidden.data(), 0,
-                                    sizeof(float) * local_hidden.size());
+                // Read draft hidden states to host for LM-head projection.
+                local_hidden.resize((size_t)hidden * q_len);
+                ggml_backend_tensor_get(draft_sg.hidden_states, local_hidden.data(), 0,
+                                        sizeof(float) * local_hidden.size());
+            }
         }
 
         // 3. Project draft hidden → token IDs via target LM head
@@ -1897,9 +2097,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         // draft tree from per-position top-K, verify all nodes in one
         // ancestor-masked target forward, walk the verified path, then roll
         // recurrent/KV state forward to the accepted path. Higher acceptance
-        // per step than chain verify. Local draft only; greedy bonus token
-        // (sampled tree-verify is a follow-up). On any failure we fall through
-        // is unsafe (draft graph already built for chain), so we bail to false.
+        // per step than chain verify. Local draft only. On any failure we
+        // fall through is unsafe (draft graph already built for chain), so we
+        // bail to false.
         // The tree path handles plain generation only. Requests using features
         // the tree branch does not implement — thinking-budget forced close,
         // tool-call hint injection, stall recovery, or the min-tokens floor
@@ -1910,7 +2110,17 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             !(hint_tokens && n_generated < (int)hint_tokens->size()) &&
             stall_tool_prefix_tokens == nullptr &&
             (int)out_tokens.size() >= _min_floor;
-        if (cfg_.ddtree_mode && target->supports_tree_verify() &&
+        // kvflash: only take the non-paged tree path while the read prefix
+        // [0, committed) is identity-resident and the write span (+FA padding)
+        // fits the resident pool. Full-attention only (windowed FA padding could
+        // index past the pool). Otherwise the slot-mapped chain verify handles
+        // it. Non-kvflash is unaffected.
+        const bool kvflash_tree_ok =
+            !kvflash_active() ||
+            (cfg_.fa_window == 0 &&
+             committed + cfg_.ddtree_budget + 1 + cfg_.kq_stride_pad <= kvflash_tokens_ &&
+             kvflash_pager_.identity_prefix_covers(committed));
+        if (cfg_.ddtree_mode && target->supports_tree_verify() && kvflash_tree_ok &&
             !use_remote_draft && q_len > 1 && tree_special_inactive) {
             const int L = q_len - 1;
             const int K = (cfg_.ddtree_budget > L) ? 8 : 1;
@@ -1923,6 +2133,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 return false;
             }
             // Tree depth L draws from draft rows 1..q_len-1 (row 0 = the seed).
+            // Known limitation: branch descendants beyond depth 1 still come
+            // from one spine-conditioned block-draft forward, so a confident
+            // draft may not beat the chain.
             DDTree tree = build_ddtree(top_lp.data() + (size_t)K, top_ids.data() + (size_t)K,
                                        L, K, cfg_.ddtree_budget, cfg_.ddtree_chain_seed);
             const int N = cfg_.ddtree_budget + 1;   // fixed alloc width
@@ -1931,63 +2144,226 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             flat_tokens[0] = last_tok;
             for (int i = 0; i < tree.n_nodes; i++) flat_tokens[1 + i] = tree.token_ids[i];
 
-            std::vector<int32_t> posterior;
-            if (!target->verify_tree(committed, tree, flat_tokens, N, posterior, nullptr)) {
-                std::fprintf(stderr, "spec-decode: verify_tree failed\n");
+            if (!sampled_verify && !target->snapshot_kv()) {
                 step_graph_destroy(draft_sg);
                 return false;
             }
 
-            int next_token = -1, bonus_node = 0;
-            std::vector<int> accepted =
-                follow_verified_tree(tree, posterior.data(), next_token, &bonus_node);
+            std::vector<int32_t> posterior;
+            std::vector<float>   node_logits;
+            if (!target->verify_tree(committed, tree, flat_tokens, N, posterior,
+                                     sampled_verify ? &node_logits : nullptr)) {
+                std::fprintf(stderr, "spec-decode: verify_tree failed\n");
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+            target_forwards++;
 
-            int commit_n = (int)accepted.size();          // root + accepted children
-            if (commit_n > need_commit_budget) commit_n = need_commit_budget;
-            if (commit_n <= 0) { step_graph_destroy(draft_sg); break; }
+            int next_token = -1, bonus_node = 0;
+            std::vector<int> accepted;
+            if (!sampled_verify) {
+                accepted =
+                    follow_verified_tree(tree, posterior.data(), next_token, &bonus_node);
+            } else {
+                accepted.reserve((size_t)tree.n_nodes + 1);
+                accepted.push_back(0);
+                std::vector<int32_t> hist = out_tokens;
+                hist.push_back(last_tok);
+                const int vocab = w_.n_vocab;
+                int cur = 0;
+                int stok = sample_logits(node_logits.data() + (size_t)cur * vocab,
+                                         vocab, sampler_, hist, sampler_rng_);
+                while (true) {
+                    auto it = tree.child_maps[cur].find(stok);
+                    if (it == tree.child_maps[cur].end()) break;
+                    cur = it->second;
+                    accepted.push_back(cur);
+                    hist.push_back(stok);
+                    stok = sample_logits(node_logits.data() + (size_t)cur * vocab,
+                                         vocab, sampler_, hist, sampler_rng_);
+                }
+                next_token = stok;
+            }
+
+            int accepted_n = (int)accepted.size();        // root + accepted children
+            if (accepted_n > need_commit_budget) accepted_n = need_commit_budget;
+            if (accepted_n <= 0) { step_graph_destroy(draft_sg); break; }
 
             // Emit the accepted path: slot 0 = last_tok (pending from prev iter),
             // each subsequent accepted node = its tree token.
             bool hit_eos = false;
-            int emitted = 0;
-            for (int i = 0; i < commit_n; i++) {
+            int accepted_emitted = 0;
+            for (int i = 0; i < accepted_n; i++) {
                 const int dfs = accepted[i];
                 const int32_t tok = (dfs == 0) ? last_tok : tree.token_ids[dfs - 1];
                 out_tokens.push_back(tok);
                 io.emit(tok);
-                emitted++;
+                accepted_emitted++;
                 if (io.cancelled) { hit_eos = true; break; }
                 if (target->is_eos(tok)) { hit_eos = true; break; }
             }
-            last_tok = next_token;
 
             // Telemetry: accepted children (exclude the always-committed root).
-            n_accept_sum += std::max(0, emitted - 1);
-            n_draft_steps++;
+            n_accept_sum += std::max(0, accepted_emitted - 1);
 
-            if (hit_eos || last_tok < 0 || target->is_eos(last_tok)) {
-                committed   += emitted;
-                n_generated += emitted;
-                break;
+            if (accepted_emitted <= 0) { step_graph_destroy(draft_sg); break; }
+
+            if (!sampled_verify) {
+                const int root_last_tok = last_tok;
+                constexpr int kFastRollbackThreshold = 5;
+                const bool use_tree_fast_rollback =
+                    target->supports_fast_rollback() &&
+                    accepted_emitted >= kFastRollbackThreshold;
+
+                if (use_tree_fast_rollback) {
+                    // Fast greedy production path: restore to the accepted path
+                    // from tree captures and defer the bonus as next step's root.
+                    std::vector<int> accepted_committed(accepted.begin(),
+                                                        accepted.begin() + accepted_emitted);
+                    if (!target->rollback_to_tree(committed, tree, accepted_committed)) {
+                        std::fprintf(stderr, "spec-decode: rollback_to_tree failed\n");
+                        step_graph_destroy(draft_sg);
+                        return false;
+                    }
+                    last_tok = next_token;
+
+                    if (feature_mirror_.target_feat && !draft_parked_) {
+                        draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
+                                                        feature_mirror_, committed, accepted_emitted);
+                    }
+
+                    committed   += accepted_emitted;
+                    cache_.cur_pos = committed;
+                    n_generated += accepted_emitted;
+                    n_draft_steps++;
+                    if (hit_eos || io.cancelled || n_generated >= n_gen ||
+                        last_tok < 0 || target->is_eos(last_tok)) {
+                        break;
+                    }
+                    continue;
+                }
+
+                // Low-accept greedy path: mirror the chain's exact replay so the
+                // next step starts from replayed F32 recurrent state. The accepted
+                // path has already been emitted above; only emit the bonus here.
+                int total_emitted = accepted_emitted;
+                const bool can_commit_bonus =
+                    !hit_eos && !io.cancelled && next_token >= 0 &&
+                    total_emitted < need_commit_budget;
+
+                std::vector<int32_t> replay_batch;
+                replay_batch.reserve((size_t)accepted_emitted + (can_commit_bonus ? 1 : 0));
+                for (int i = 0; i < accepted_emitted; i++) {
+                    const int dfs = accepted[i];
+                    replay_batch.push_back((dfs == 0) ? root_last_tok : tree.token_ids[dfs - 1]);
+                }
+                if (can_commit_bonus) replay_batch.push_back(next_token);
+
+                if (!target->restore_kv()) {
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                int replay_last_tok = -1;
+                if (!target->verify_batch(replay_batch, committed, replay_last_tok, nullptr)) {
+                    std::fprintf(stderr, "spec-decode: tree replay failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                target_forwards++;
+
+                if (can_commit_bonus) {
+                    out_tokens.push_back(next_token);
+                    io.emit(next_token);
+                    total_emitted++;
+                    if (io.cancelled) {
+                        hit_eos = true;
+                    } else if (target->is_eos(next_token)) {
+                        hit_eos = true;
+                    }
+                }
+
+                last_tok = replay_last_tok;
+                if (feature_mirror_.target_feat && !draft_parked_) {
+                    draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
+                                                    feature_mirror_, committed, total_emitted);
+                }
+
+                committed   += total_emitted;
+                cache_.cur_pos = committed;
+                n_generated += total_emitted;
+                n_draft_steps++;
+                if (hit_eos || io.cancelled || n_generated >= n_gen ||
+                    last_tok < 0 || target->is_eos(last_tok)) {
+                    break;
+                }
+                continue;
             }
 
-            // Roll recurrent + KV state forward to the committed accepted path.
+            // Sampled path keeps the distribution-preserving bonus replay but
+            // still needs tree rollback for the accepted prefix first.
             std::vector<int> accepted_committed(accepted.begin(),
-                                                accepted.begin() + emitted);
+                                                accepted.begin() + accepted_emitted);
             if (!target->rollback_to_tree(committed, tree, accepted_committed)) {
                 std::fprintf(stderr, "spec-decode: rollback_to_tree failed\n");
                 step_graph_destroy(draft_sg);
                 return false;
             }
 
-            // Sync draft-side feature mirror over the committed range.
-            if (feature_mirror_.target_feat && !draft_parked_) {
-                draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
-                                                feature_mirror_, committed, emitted);
+            int total_emitted = accepted_emitted;
+            int bonus_last_tok = -1;
+            std::vector<float> bonus_logits;
+            const bool can_commit_bonus =
+                !hit_eos && !io.cancelled && next_token >= 0 &&
+                total_emitted < need_commit_budget;
+            if (can_commit_bonus) {
+                const int bonus_pos = committed + total_emitted;
+                std::vector<int32_t> bonus_vec(1, next_token);
+                if (!target->verify_batch(bonus_vec, bonus_pos, bonus_last_tok, nullptr)) {
+                    std::fprintf(stderr, "spec-decode: tree bonus replay failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                target_forwards++;
+                if (!target->read_verify_logits(1, bonus_logits)) {
+                    std::fprintf(stderr, "spec-decode: tree bonus logits read failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                if (bonus_logits.empty()) {
+                    std::fprintf(stderr, "spec-decode: tree bonus logits empty\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+
+                out_tokens.push_back(next_token);
+                io.emit(next_token);
+                total_emitted++;
+                if (io.cancelled) {
+                    hit_eos = true;
+                } else if (target->is_eos(next_token)) {
+                    hit_eos = true;
+                }
+
+                const int vocab_v = (int)bonus_logits.size();
+                last_tok = sample_logits(bonus_logits.data(), vocab_v,
+                                         sampler_, out_tokens, sampler_rng_);
+            } else {
+                last_tok = next_token;
             }
 
-            committed   += emitted;
-            n_generated += emitted;
+            // Sampled path commits the bonus in-step, so sync accepted+bonus.
+            if (feature_mirror_.target_feat && !draft_parked_) {
+                draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
+                                                feature_mirror_, committed, total_emitted);
+            }
+
+            committed   += total_emitted;
+            cache_.cur_pos = committed;
+            n_generated += total_emitted;
+            n_draft_steps++;
+            if (hit_eos || io.cancelled || n_generated >= n_gen || last_tok < 0) {
+                break;
+            }
             continue;
         }
 
@@ -2021,19 +2397,88 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             step_graph_destroy(draft_sg);
             return false;
         }
+        target_forwards++;
 
-        // 5. Acceptance: longest matching prefix between draft and target argmax
+        // 5. Acceptance. Greedy: longest matching prefix between draft and
+        // target argmax. Sampled-verify: walk the chain drawing each next
+        // token from the target's sampler chain; accept while the draft
+        // guessed the drawn token, and the first mismatch becomes the bonus
+        // token (it is already a valid target sample at that position).
         int accept_n = 1;
-        for (int i = 0; i < q_len - 1; i++) {
-            if (draft_tok[i + 1] == target_tok[i]) accept_n++;
-            else break;
+        int bonus_tok = -1;
+        if (sampled_verify) {
+            if (!target->read_verify_logits(q_len, verify_logits)) {
+                std::fprintf(stderr, "spec-decode: verify logits read failed\n");
+                target->restore_kv();
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+            const int vocab_v = (int)(verify_logits.size() / (size_t)q_len);
+            static const bool kSvDebug = []() {
+                const char * e = std::getenv("DFLASH_SV_DEBUG");
+                return e != nullptr && std::string(e) == "1";
+            }();
+            if (kSvDebug) {
+                // Row-alignment check: CPU argmax over each bulk-read row must
+                // equal the GPU argmax (target_tok). Divergence = misaligned
+                // or stale bulk read.
+                for (int i = 0; i < q_len; i++) {
+                    const float * row = verify_logits.data() + (size_t)i * vocab_v;
+                    int am = 0; float best = row[0];
+                    for (int v = 1; v < vocab_v; v++)
+                        if (row[v] > best) { best = row[v]; am = v; }
+                    if (am != target_tok[i]) {
+                        std::fprintf(stderr,
+                            "[sv-debug] ROW MISMATCH i=%d cpu_argmax=%d (%.3f) "
+                            "gpu_argmax=%d (%.3f) vocab_v=%d\n",
+                            i, am, best, target_tok[i],
+                            target_tok[i] < vocab_v ? row[target_tok[i]] : -999.0f,
+                            vocab_v);
+                        break;
+                    }
+                }
+            }
+            // Penalty history must match AR exactly: when AR samples the
+            // token after X, X is already in out_tokens. The seed
+            // draft_tok[0] is committed by this step's replay but not yet
+            // in out_tokens, so add it before the walk — without it the
+            // repetition penalty never sees the seed and the sampled
+            // distribution drifts from AR whenever penalties are active.
+            verify_history = out_tokens;
+            verify_history.push_back(draft_tok[0]);
+            bool mismatched = false;
+            for (int i = 0; i < q_len - 1; i++) {
+                const int s = sample_logits(
+                    verify_logits.data() + (size_t)i * vocab_v, vocab_v,
+                    sampler_, verify_history, sampler_rng_);
+                if (kSvDebug && n_draft_steps < 3 && i < 4) {
+                    std::fprintf(stderr,
+                        "[sv-debug] step=%d pos=%d seed/draft0=%d draft=%d "
+                        "sampled=%d\n",
+                        n_draft_steps, i, draft_tok[0], draft_tok[i + 1], s);
+                }
+                if (draft_tok[i + 1] == s) {
+                    accept_n++;
+                    verify_history.push_back(s);
+                } else {
+                    bonus_tok = s;
+                    mismatched = true;
+                    break;
+                }
+            }
+            (void)mismatched;
+        } else {
+            for (int i = 0; i < q_len - 1; i++) {
+                if (draft_tok[i + 1] == target_tok[i]) accept_n++;
+                else break;
+            }
+            bonus_tok = (accept_n < q_len) ? target_tok[accept_n - 1] : -1;
         }
         // Track hint acceptance telemetry.
         if (hint_fill > 0) {
             n_hint_proposed += hint_fill;
             n_hint_accepted += std::min(hint_fill, accept_n - 1);
         }
-        int bonus_tok = (accept_n < q_len) ? target_tok[accept_n - 1] : -1;
         int commit_n  = accept_n + (bonus_tok >= 0 ? 1 : 0);
         if (commit_n > need_commit_budget) {
             commit_n = need_commit_budget;
@@ -2088,6 +2533,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 step_graph_destroy(draft_sg);
                 return false;
             }
+            target_forwards++;
         }
 
         // Build replay_tok for emitting committed tokens.
@@ -2198,6 +2644,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     step_graph_destroy(draft_sg);
                     return false;
                 }
+                target_forwards++;
             }
             committed += emitted;
             cache_.cur_pos = committed;
@@ -2209,6 +2656,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     step_graph_destroy(draft_sg);
                     return false;
                 }
+                target_forwards++;
                 for (int32_t tok : *stall_tool_prefix_tokens) {
                     out_tokens.push_back(tok);
                     io.emit(tok);
@@ -2222,7 +2670,23 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             // next draft step. The floor_to_ar path never reaches the next
             // iteration — it sets cache_.last_tok directly below and returns —
             // so last_tok is intentionally left untouched when flooring.
-            last_tok = replay_last_tok;
+            //
+            // Sampled-verify: the seed is committed as-is by the next step
+            // (draft_tok[0]), so it must itself be a sample from the target
+            // distribution. replay_last_tok is the argmax — seeding with it
+            // injects one greedy token per step, which biases the output and
+            // locks long generations into repetition loops.
+            if (sampled_verify && !replay_tok.empty() &&
+                target->read_verify_logits((int)replay_tok.size(), verify_logits)) {
+                const int vocab_v =
+                    (int)(verify_logits.size() / replay_tok.size());
+                last_tok = sample_logits(
+                    verify_logits.data() +
+                        (replay_tok.size() - 1) * (size_t)vocab_v,
+                    vocab_v, sampler_, out_tokens, sampler_rng_);
+            } else {
+                last_tok = replay_last_tok;
+            }
             committed += emitted;
         }
         cache_.cur_pos = committed;
@@ -2244,6 +2708,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 (float)((double)n_accept_sum / (double)total_draft_pos);
             const int ar_n_gen = n_gen - n_generated;
             if (ar_n_gen <= 0) {
+                log_target_forward_stats();
                 io.emit(-1);
                 return true;
             }
@@ -2251,6 +2716,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
                                     tail_hook, forced_close_out,
                                     degenerate_close_out);
+            log_target_forward_stats();
             io.emit(-1);
             return ok;
         }
@@ -2274,6 +2740,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     step_graph_destroy(draft_sg);
                     return false;
                 }
+                target_forwards++;
             }
             committed += emitted;
             cache_.cur_pos = committed;
@@ -2284,6 +2751,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 (float)((double)n_accept_sum / (double)total_draft_pos);
             const int ar_n_gen = n_gen - n_generated;
             if (ar_n_gen <= 0) {
+                log_target_forward_stats();
                 io.emit(-1);
                 return true;
             }
@@ -2292,6 +2760,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
                                     tail_hook, forced_close_out,
                                     degenerate_close_out);
+            log_target_forward_stats();
             io.emit(-1);
             return ok;
         }
@@ -2311,6 +2780,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                  n_generated > 0 ? n_generated / decode_s : 0.0,
                  n_draft_steps, n_accept_sum, total_draft_pos, accept_pct,
                  n_draft_steps > 0 ? (double)n_generated / (double)n_draft_steps : 0.0);
+    log_target_forward_stats();
     if (n_hint_proposed > 0) {
         std::fprintf(stderr, "[spec-decode] hint tokens: %d/%d accepted (%.1f%%)\n",
                      n_hint_accepted, n_hint_proposed,

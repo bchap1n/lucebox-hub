@@ -269,6 +269,8 @@ using dflash::common::free_qwen35_layer_split_shards;
 // ─── Speculative decode — generic loop in common/, qwen35 layer-split adapter.
 #include "qwen35_layer_split_dflash_target.h"
 #include "common/dflash_spec_decode.h"
+#include "common/gguf_mmap.h"
+#include "common/geometric_draft_topk_cuda.h"
 using dflash::common::is_eos_tok;
 
 // ─── Layer-split daemon — extracted to src/qwen35/layer_split_daemon.{h,cpp} ─
@@ -898,6 +900,15 @@ int main(int argc, char ** argv) {
         }
         else if (std::strncmp(argv[i], "--max-ctx=", 10) == 0) {
             g_max_ctx_override = std::atoi(argv[i] + 10);
+        }
+        // Sampler params for the positional (non-daemon) path, so benchmarks can
+        // exercise the sample_logits chain (and its GPU port). Same field order
+        // as the daemon ` samp=` tail: temp,top_p,top_k,rep_pen,seed[,freq,pres].
+        else if (std::strncmp(argv[i], "--samp=", 7) == 0) {
+            std::string fake = std::string(" samp=") + (argv[i] + 7);
+            if (parse_sampler_token(fake, g_sampler) && g_sampler.seed != 0) {
+                g_sampler_rng.seed(g_sampler.seed);
+            }
         }
         // KV cache type flags (mirror llama-cli -ctk / -ctv).
         // Set the env var before resolve_kv_types() reads it inside create_target_cache.
@@ -1619,19 +1630,14 @@ int main(int argc, char ** argv) {
                 if (!gctx) {
                     std::fprintf(stderr, "[time-breakdown] failed to re-open GGUF for hybrid\n");
                 } else {
-                    int fd = ::open(target_path, O_RDONLY);
-                    struct stat st_buf;
-                    bool mmap_ok = (fd >= 0 && ::fstat(fd, &st_buf) == 0);
-                    void * mmap_addr = mmap_ok
-                        ? ::mmap(nullptr, (size_t)st_buf.st_size, PROT_READ, MAP_PRIVATE, fd, 0)
-                        : MAP_FAILED;
-                    if (fd >= 0) ::close(fd);
-
-                    if (mmap_addr == MAP_FAILED) {
-                        std::fprintf(stderr, "[time-breakdown] mmap failed for hybrid\n");
+                    dflash::common::GgufMmap _mf;
+                    std::string _mferr;
+                    if (!_mf.open(target_path, _mferr)) {
+                        std::fprintf(stderr, "[time-breakdown] mmap failed for hybrid: %s\n", _mferr.c_str());
                         gguf_free(gctx);
                     } else {
-                        const size_t file_size = (size_t)st_buf.st_size;
+                        const size_t file_size = _mf.size();
+                        const void * mmap_addr = _mf.data();
                         const size_t data_start = gguf_get_data_offset(gctx);
                         const auto * file_bytes = (const uint8_t *)mmap_addr;
 
@@ -1818,7 +1824,8 @@ int main(int argc, char ** argv) {
 
                                 // Init pipelined state
                                 PipelinedDecodeState pipe_state;
-                                if (!init_pipelined_decode_state(pipe_state, backend, w, cache, *hybrid, ctx, g_kq_stride_pad)) {
+                                if (!init_pipelined_decode_state(pipe_state, backend, w, target_path,
+                                                                 cache, *hybrid, ctx, g_kq_stride_pad)) {
                                     std::fprintf(stderr, "[time-breakdown] pipelined state init failed\n");
                                     continue;
                                 }
@@ -1915,7 +1922,8 @@ int main(int argc, char ** argv) {
                                         int ctx = 2000;
                                         if (ctx + 1 <= max_ctx) {
                                             PipelinedDecodeState pipe_state;
-                                            if (init_pipelined_decode_state(pipe_state, backend, w, cache, *hybrid_realistic, ctx, g_kq_stride_pad)) {
+                                            if (init_pipelined_decode_state(pipe_state, backend, w, target_path,
+                                                                            cache, *hybrid_realistic, ctx, g_kq_stride_pad)) {
                                                 std::vector<float> act_cur_pipe((size_t)hidden, 0.0f);
                                                 ggml_backend_tensor_set(pipe_state.gpu_state.act_cur, act_cur_pipe.data(), 0,
                                                                         sizeof(float) * (size_t)hidden);
@@ -1973,7 +1981,6 @@ int main(int argc, char ** argv) {
                             }
                         }
 
-                        ::munmap(mmap_addr, file_size);
                         gguf_free(gctx);
                     }
                 }
@@ -2078,7 +2085,8 @@ int main(int argc, char ** argv) {
                 ggml_backend_tensor_set(psg.positions, pf_pos.data(), 0,
                                         sizeof(int32_t) * pf_pos.size());
                 if (with_m) {
-                    build_causal_mask(pf_mask, kv_len_p, nt, start, g_kq_stride_pad);
+                    build_causal_mask(pf_mask, kv_len_p, nt, start, g_kq_stride_pad,
+                                      /*win_start=*/0, /*kv_pad_override=*/(int)psg.attn_mask->ne[0]);
                     ggml_backend_tensor_set(psg.attn_mask, pf_mask.data(), 0,
                                             sizeof(uint16_t) * pf_mask.size());
                 }
@@ -2734,7 +2742,8 @@ int main(int argc, char ** argv) {
 
                 if (is_attn && with_mask && lsg.attn_mask) {
                     std::vector<uint16_t> mask_buf;
-                    build_causal_mask(mask_buf, kv_len, n_tokens, /*kv_start=*/start, g_kq_stride_pad);
+                    build_causal_mask(mask_buf, kv_len, n_tokens, /*kv_start=*/start, g_kq_stride_pad,
+                                      /*win_start=*/0, /*kv_pad_override=*/(int)lsg.attn_mask->ne[0]);
                     ggml_backend_tensor_set(lsg.attn_mask, mask_buf.data(), 0,
                                             sizeof(uint16_t) * mask_buf.size());
                 }
@@ -2940,7 +2949,8 @@ int main(int argc, char ** argv) {
                                          ? (start - g_fa_window) : 0;
             const int pf_win_len = kv_len - pf_win_start;
             build_causal_mask(pf_mask_buf, pf_win_len, n_tokens,
-                              /*kv_start=*/start, g_kq_stride_pad, /*win_start=*/pf_win_start);
+                              /*kv_start=*/start, g_kq_stride_pad, /*win_start=*/pf_win_start,
+                              /*kv_pad_override=*/(int)sg.attn_mask->ne[0]);
             ggml_backend_tensor_set(sg.attn_mask, pf_mask_buf.data(), 0,
                                     sizeof(uint16_t) * pf_mask_buf.size());
         }
@@ -3273,16 +3283,35 @@ int main(int argc, char ** argv) {
                 }
             } else {
                 // DDTree K>1: need real log-probs for best-first tree scoring.
-                // Transfer full logits for positions 1..q_len-1.
-                if (!draft_hidden_bridge) {
-                    ggml_backend_tensor_get(draft_sg.logits, draft_logits_buf.data(), 0,
-                                            sizeof(float) * vocab * q_len);
+                bool topk_done = false;
+#ifdef DFLASH27B_HAVE_DRAFT_TOPK
+                // GPU path: top-K + logsumexp on the draft logits device buffer
+                // (positions 1..q_len-1), no full-vocab D2H. Escape: DFLASH_GPU_DRAFT_TOPK=0.
+                static const bool kGpuDraftTopk = [](){
+                    const char * v = std::getenv("DFLASH_GPU_DRAFT_TOPK");
+                    return v == nullptr || v[0] != '0';
+                }();
+                if (kGpuDraftTopk && !draft_hidden_bridge) {
+                    topk_done = dflash::common::geometric_extract_draft_topk_cuda(
+                        (const float *)draft_sg.logits->data + (size_t)vocab,
+                        L, vocab, ddtree_K,
+                        ddtree_top_log_probs.data(),
+                        ddtree_top_token_ids.data(),
+                        ddtree_temp);
                 }
-                extract_draft_topk(draft_logits_buf.data() + (size_t)vocab,
-                                   L, vocab, ddtree_K,
-                                   ddtree_top_log_probs.data(),
-                                   ddtree_top_token_ids.data(),
-                                   ddtree_temp);
+#endif
+                if (!topk_done) {
+                    // Transfer full logits for positions 1..q_len-1, extract on CPU.
+                    if (!draft_hidden_bridge) {
+                        ggml_backend_tensor_get(draft_sg.logits, draft_logits_buf.data(), 0,
+                                                sizeof(float) * vocab * q_len);
+                    }
+                    extract_draft_topk(draft_logits_buf.data() + (size_t)vocab,
+                                       L, vocab, ddtree_K,
+                                       ddtree_top_log_probs.data(),
+                                       ddtree_top_token_ids.data(),
+                                       ddtree_temp);
+                }
             }
         }
         auto T_draft_logits = sync_us();
@@ -3422,16 +3451,40 @@ int main(int argc, char ** argv) {
             T_verify_compute = sync_us();
             tt_verify_compute += std::chrono::duration<double, std::micro>(T_verify_compute - T_verify_set).count();
 
-            // DDTree test mode reads full logits and computes posterior on
-            // CPU. The GPU argmax shortcut has returned -1 for tree-shaped
-            // verify graphs on some builds, which makes the harness stop
-            // after the root even though logits are valid. This is test-only;
-            // server decode paths are unaffected.
+            // DDTree posterior: per-node argmax over the verify logits.
+            //   default        : full vocab×N D2H + CPU argmax (legacy).
+            //   GPU_VERIFY_ARGMAX=1: read the in-graph batched GPU argmax
+            //                        (tree_verify_argmax) — N int32s, no bulk D2H.
+            //   GPU_VERIFY_ARGMAX=2: run BOTH and report per-step mismatches
+            //                        (validates the historical "-1 / tie" concern).
+            static const int kGpuVerifyArgmax = [](){
+                const char * v = std::getenv("DFLASH_GPU_VERIFY_ARGMAX");
+                return v ? std::atoi(v) : 0;
+            }();
             std::vector<int32_t> posterior(N_actual);
-            ggml_backend_tensor_get(sg.logits, verify_logits_buf.data(), 0,
-                                    sizeof(float) * (size_t)vocab * N_actual);
-            for (int i = 0; i < N_actual; i++) {
-                posterior[i] = argmax_f32(verify_logits_buf.data() + (size_t)i * vocab, vocab);
+            bool logits_resident = false;  // verify_logits_buf populated this step?
+            if (kGpuVerifyArgmax == 1 && sg.argmax_tokens) {
+                ggml_backend_tensor_get(sg.argmax_tokens, posterior.data(), 0,
+                                        sizeof(int32_t) * N_actual);
+            } else {
+                ggml_backend_tensor_get(sg.logits, verify_logits_buf.data(), 0,
+                                        sizeof(float) * (size_t)vocab * N_actual);
+                logits_resident = true;
+                for (int i = 0; i < N_actual; i++) {
+                    posterior[i] = argmax_f32(verify_logits_buf.data() + (size_t)i * vocab, vocab);
+                }
+                if (kGpuVerifyArgmax == 2 && sg.argmax_tokens) {
+                    std::vector<int32_t> gpu_post(N_actual);
+                    ggml_backend_tensor_get(sg.argmax_tokens, gpu_post.data(), 0,
+                                            sizeof(int32_t) * N_actual);
+                    int mism = 0, first = -1;
+                    for (int i = 0; i < N_actual; i++)
+                        if (gpu_post[i] != posterior[i]) { mism++; if (first < 0) first = i; }
+                    if (mism)
+                        std::fprintf(stderr, "[verify_argmax cmp] step=%d N=%d mismatches=%d "
+                                     "first@%d gpu=%d cpu=%d\n", n_draft_steps, N_actual, mism,
+                                     first, gpu_post[first], posterior[first]);
+                }
             }
             auto T_verify_logits_ddtree = sync_us();
             tt_verify_logits += std::chrono::duration<double, std::micro>(
@@ -3442,10 +3495,18 @@ int main(int argc, char ** argv) {
             int bonus_node_idx = 0;
             std::vector<int> accepted = follow_verified_tree(tree, posterior.data(), next_token, &bonus_node_idx);
             if (g_sampler.temp > 0.0f) {
+                // Sampling needs the bonus node's full logit row. If we took the
+                // GPU-argmax path we skipped the bulk D2H, so fetch just that row.
                 std::vector<float> bonus_logits(vocab);
-                std::memcpy(bonus_logits.data(),
-                            verify_logits_buf.data() + (size_t)bonus_node_idx * vocab,
-                            (size_t)vocab * sizeof(float));
+                if (logits_resident) {
+                    std::memcpy(bonus_logits.data(),
+                                verify_logits_buf.data() + (size_t)bonus_node_idx * vocab,
+                                (size_t)vocab * sizeof(float));
+                } else {
+                    ggml_backend_tensor_get(sg.logits, bonus_logits.data(),
+                                            (size_t)bonus_node_idx * vocab * sizeof(float),
+                                            (size_t)vocab * sizeof(float));
+                }
                 next_token = sample_logits(bonus_logits.data(), vocab, g_sampler, out_all, g_sampler_rng);
             }
             const int accept_depth = (int)accepted.size();  // includes root

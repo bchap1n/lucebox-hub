@@ -57,6 +57,7 @@ struct ServerConfig {
     bool        enable_cors = true;
     std::string model_name  = "dflash";
     int         prefix_cache_cap = 32;  // prefix cache slots (0 disables)
+    int         prefill_cache_cap = 0;  // full-prompt/prefill cache slots (0 disables)
 
     // Thinking-budget v2. Applied when a request opts in via
     // `thinking: {type: "enabled"}` or `reasoning: {effort: ...}`.
@@ -207,6 +208,7 @@ struct ParsedRequest {
     std::string               response_id;
     // Thinking/reasoning state
     bool                      thinking_enabled = true;
+    bool                      started_in_thinking = false;
     // True when the request opted in to the thinking-budget envelope via
     // `thinking: {type: "enabled"}`. Distinct from thinking_enabled (which
     // can be set via the chat template kwarg alone). When true, the response

@@ -1,10 +1,18 @@
 // Qwen35DFlashTarget — DFlashTarget adapter for qwen35 hybrid models.
 
 #include "qwen35_dflash_target.h"
+#include "common/gpu_runtime_compat.h"
 #include "graph_builders.h"
 #include "step_graph.h"
 #include "attn_masks.h"
+#include "common/geometric_draft_topk_cuda.h"
+// gpu_runtime_compat.h maps the raw cudaStream_t / cudaMemcpy* symbols used
+// below (rollback_to / rollback_to_tree) onto their HIP equivalents. Without
+// it the file only compiles on CUDA via a transitive <cuda_runtime.h>; HIP
+// builds (e.g. gfx1151) fail with "cudaStream_t undeclared".
+#include "common/gpu_runtime_compat.h"
 
+#include <cstdlib>
 #include <cstring>
 
 // ggml_get_to_fp32_cuda is not in any public header — it lives in
@@ -58,7 +66,10 @@ bool Qwen35DFlashTarget::verify_batch(
         }
     }
 
-    const bool do_capture = fast_rollback_ && capture_ssm_intermediates;
+    // kvflash's set_rows KV-write is mutually exclusive with delta-intermediate
+    // capture (graph_builders gates use_kv_write_rows on !capture_delta_intermediate);
+    // skip capture under the pager so --ddtree + --kvflash doesn't fail verify.
+    const bool do_capture = fast_rollback_ && capture_ssm_intermediates && pager_ == nullptr;
 
     if (!build_target_step(sg_, w_, cache_, backend_,
                            /*kv_start=*/base_pos, n_tokens,
@@ -171,11 +182,22 @@ bool Qwen35DFlashTarget::verify_batch(
     return true;
 }
 
+bool Qwen35DFlashTarget::read_verify_logits(int n_tokens, std::vector<float> & out) {
+    if (!sg_.logits || n_tokens <= 0) return false;
+    const int64_t vocab = sg_.logits->ne[0];
+    if (n_tokens > (int)sg_.logits->ne[1]) return false;
+    out.resize((size_t)n_tokens * (size_t)vocab);
+    ggml_backend_tensor_get(sg_.logits, out.data(), 0,
+                            sizeof(float) * out.size());
+    return true;
+}
+
 bool Qwen35DFlashTarget::supports_tree_verify() const {
-    // Tree verify reuses the fast-rollback SSM-intermediate capture, and builds
-    // the non-paged tree graph + logical attention mask. It is NOT slot-mapped,
-    // so it is incompatible with the kvflash pager — gate it off when paging.
-    return fast_rollback_ && pager_ == nullptr;
+    // Tree verify reuses the fast-rollback SSM-intermediate capture and builds a
+    // non-paged, contiguous tree graph. Pure capability here; the kvflash
+    // identity/pool precondition is enforced at the call site in do_spec_decode
+    // and re-checked defensively in verify_tree() below.
+    return fast_rollback_;
 }
 
 bool Qwen35DFlashTarget::verify_tree(
@@ -189,6 +211,20 @@ bool Qwen35DFlashTarget::verify_tree(
     const int N        = n_alloc;                 // fixed alloc width (budget+1)
     const int N_actual = 1 + tree.n_nodes;        // real tree size incl. root
     if (N_actual <= 0 || N_actual > N || (int)flat_tokens.size() < N) return false;
+    // kvflash: the tree graph reads the prefix [0, committed) contiguously and
+    // writes rows [committed, committed+N). Only valid while that prefix is
+    // identity-resident and the write span fits the pool. do_spec_decode gates
+    // on this; reaching here otherwise is a bug — fail cleanly, never read past
+    // the pool.
+    if (pager_ &&
+        (committed + N > pager_->pool_tokens() ||
+         !pager_->identity_prefix_covers(committed))) {
+        std::fprintf(stderr,
+            "verify_tree: kvflash layout not identity-contiguous "
+            "(committed=%d N=%d pool=%d)\n",
+            committed, N, pager_->pool_tokens());
+        return false;
+    }
     const int hidden = w_.n_embd;
 
     // Tree-verify graph: ancestor-masked batched forward over DFS-ordered nodes.
@@ -258,13 +294,38 @@ bool Qwen35DFlashTarget::verify_tree(
         return false;
     }
 
-    // Posterior = per-node target argmax. Tree-shaped graphs can return -1 from
-    // the GPU argmax shortcut, so compute argmax on CPU from full logits.
+    // Posterior = per-node target argmax.
+    //
+    // The verify graph already computes a batched per-node GPU argmax
+    // (sg_.argmax_tokens, built by build_target_step_tree). When the caller does
+    // not need the full logits (greedy decode, logits_out == nullptr) we read
+    // those N_actual int32s directly and skip the vocab×N_actual D2H + CPU
+    // argmax entirely — eliminates the verify-logits transfer hotspot.
+    //
+    // Historically the GPU argmax shortcut has returned -1 for tree-shaped
+    // verify graphs on some builds; guard against that by validating every row
+    // and falling back to the CPU path for the step if any index is bad.
+    // Escape hatch: DFLASH_GPU_VERIFY_ARGMAX=0 forces the legacy CPU path.
+    static const bool kGpuVerifyArgmax = []() {
+        const char * v = std::getenv("DFLASH_GPU_VERIFY_ARGMAX");
+        return v == nullptr || v[0] != '0';
+    }();
     const int vocab = (int)sg_.logits->ne[0];
+    posterior_out.resize(N_actual);
+
+    if (kGpuVerifyArgmax && !logits_out && sg_.argmax_tokens) {
+        ggml_backend_tensor_get(sg_.argmax_tokens, posterior_out.data(), 0,
+                                sizeof(int32_t) * N_actual);
+        bool ok = true;
+        for (int i = 0; i < N_actual; i++) {
+            if (posterior_out[i] < 0 || posterior_out[i] >= vocab) { ok = false; break; }
+        }
+        if (ok) return true;  // fast path; otherwise fall through to CPU argmax
+    }
+
     std::vector<float> logits((size_t)vocab * N_actual);
     ggml_backend_tensor_get(sg_.logits, logits.data(), 0,
                             sizeof(float) * (size_t)vocab * N_actual);
-    posterior_out.resize(N_actual);
     for (int i = 0; i < N_actual; i++) {
         const float * row = logits.data() + (size_t)i * vocab;
         int am = 0; float best = row[0];
@@ -414,6 +475,19 @@ bool Qwen35DFlashTarget::rollback_to_tree(
     }
 
     cudaStreamSynchronize(stream);
+    // kvflash: the tree graph writes KV directly (not slot-mapped), so this is
+    // the single owning point that advances the pager for tree-committed
+    // positions. Covers both the greedy and sampled tree fast paths; chain
+    // paths self-register through verify_batch()'s slot_for(). The call-site
+    // guard bounds the span to the resident identity pool so this never evicts,
+    // but a failed alloc must abort: returning true with unmapped slots would
+    // make the next step read stale/unmapped KV (silent corruption).
+    if (pager_ && !pager_->alloc_span(committed, commit_n)) {
+        std::fprintf(stderr,
+            "rollback_to_tree: kvflash alloc_span failed (committed=%d commit_n=%d)\n",
+            committed, commit_n);
+        return false;
+    }
     cache_.cur_pos = committed + commit_n;
     return true;
 }
@@ -429,21 +503,46 @@ bool Qwen35DFlashTarget::restore_kv() {
 }
 
 bool Qwen35DFlashTarget::supports_fast_rollback() const {
+    // Pure capability. Fast-rollback only restores recurrent SSM/conv state and
+    // defers the bonus token, so it is pager-safe even while paging: committed
+    // KV rows are written slot-mapped by verify_batch(), and the deferred bonus
+    // is re-fed at the next committed position on the following step.
     return fast_rollback_;
 }
 
 bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
-    if (!fast_rollback_) return false;
+    static const bool kFastRollbackDiag = []() {
+        const char * e = std::getenv("FAST_ROLLBACK_DIAG");
+        return e != nullptr && std::strcmp(e, "0") != 0;
+    }();
+
+    if (!fast_rollback_) {
+        if (kFastRollbackDiag) {
+            std::fprintf(stderr, "rollback_to: fast_rollback disabled\n");
+        }
+        return false;
+    }
 
     // commit_n must be a positive count. `commit_n - 1` below indexes the
     // per-step intermediates; a non-positive value underflows to a huge
     // size_t byte offset and triggers an out-of-bounds GPU read. A zero/neg
     // commit means "nothing to keep" — signal failure so the caller falls
     // back to the full restore_kv path.
-    if (commit_n <= 0) return false;
+    if (commit_n <= 0) {
+        if (kFastRollbackDiag) {
+            std::fprintf(stderr, "rollback_to: commit_n <= 0 commit_n=%d\n",
+                         commit_n);
+        }
+        return false;
+    }
 
     const int n_delta = (int)sg_.delta_captures.size();
-    if (n_delta == 0) return false;
+    if (n_delta == 0) {
+        if (kFastRollbackDiag) {
+            std::fprintf(stderr, "rollback_to: no delta_captures\n");
+        }
+        return false;
+    }
 
     // If all tokens accepted, the SSM state after processing all q_len tokens
     // is exactly what we want — no rollback needed, just fix cur_pos.
@@ -458,8 +557,26 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
 
     for (int il = 0; il < n_delta; il++) {
         const DeltaNetCapture & cap = sg_.delta_captures[il];
-        if (!cap.ssm_intermediate_states || !cap.conv_input) {
-            std::fprintf(stderr, "rollback_to: missing capture at layer %d\n", il);
+        if (!cap.ssm_intermediate_states) {
+            if (kFastRollbackDiag) {
+                std::fprintf(stderr, "rollback_to: null ssm_intermediate_states layer=%d\n",
+                             il);
+            }
+            return false;
+        }
+        if (!cap.conv_input) {
+            if (kFastRollbackDiag) {
+                std::fprintf(stderr, "rollback_to: null conv_input layer=%d\n",
+                             il);
+            }
+            return false;
+        }
+        if (rollback_idx >= (int)cap.ssm_intermediate_states->ne[3]) {
+            if (kFastRollbackDiag) {
+                std::fprintf(stderr,
+                             "rollback_to: rollback_idx OOB rollback_idx=%d slots=%d layer=%d\n",
+                             rollback_idx, (int)cap.ssm_intermediate_states->ne[3], il);
+            }
             return false;
         }
 
@@ -474,8 +591,10 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
             (const char *)cap.ssm_intermediate_states->data + ssm_src_offset;
         const auto to_fp32 = ggml_get_to_fp32_cuda(cap.ssm_intermediate_states->type);
         if (!to_fp32) {
-            std::fprintf(stderr, "rollback_to: no fp32 converter for ssm type %d (layer %d)\n",
-                         (int)cap.ssm_intermediate_states->type, il);
+            if (kFastRollbackDiag) {
+                std::fprintf(stderr, "rollback_to: no fp32 converter type=%d layer=%d\n",
+                             (int)cap.ssm_intermediate_states->type, il);
+            }
             return false;
         }
         to_fp32(ssm_src, (float *)cache_.ssm_state[il]->data,
@@ -484,6 +603,15 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
         // Conv rollback: copy conv_input[commit_n..commit_n+K-2, :, :]
         // into cache.conv_state[il].
         const int K_conv = 4;
+        if (commit_n + K_conv - 1 > (int)cap.conv_input->ne[0]) {
+            if (kFastRollbackDiag) {
+                std::fprintf(stderr,
+                             "rollback_to: conv_input OOB commit_n=%d needed=%d slots=%d layer=%d\n",
+                             commit_n, commit_n + K_conv - 1,
+                             (int)cap.conv_input->ne[0], il);
+            }
+            return false;
+        }
         const int row_cnt = (int)cap.conv_input->ne[1];
         const size_t elt = ggml_element_size(cap.conv_input);
         const size_t dpitch = (K_conv - 1) * elt;
@@ -496,8 +624,10 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
                                            width, row_cnt,
                                            cudaMemcpyDeviceToDevice, stream);
         if (ce != cudaSuccess) {
-            std::fprintf(stderr, "rollback_to: cudaMemcpy2D conv il=%d: %s\n",
-                         il, cudaGetErrorString(ce));
+            if (kFastRollbackDiag) {
+                std::fprintf(stderr, "rollback_to: cudaMemcpy2D conv layer=%d: %s\n",
+                             il, cudaGetErrorString(ce));
+            }
             return false;
         }
     }
@@ -559,12 +689,28 @@ bool Qwen35DFlashTarget::project_hidden_to_topk(
     if (st != GGML_STATUS_SUCCESS) return false;
 
     const int vocab = (int)proj_sg_.logits->ne[0];
+    top_log_probs.assign((size_t)n_tokens * K, 0.0f);
+    top_token_ids.assign((size_t)n_tokens * K, 0);
+
+#ifdef DFLASH27B_HAVE_DRAFT_TOPK
+    // GPU path: top-K + logsumexp directly on the logits device buffer, skipping
+    // the vocab×n_tokens D2H and the CPU heap extract. Falls back to the CPU path
+    // on any failure. Escape hatch: DFLASH_GPU_DRAFT_TOPK=0.
+    static const bool kGpuDraftTopk = []() {
+        const char * v = std::getenv("DFLASH_GPU_DRAFT_TOPK");
+        return v == nullptr || v[0] != '0';
+    }();
+    if (kGpuDraftTopk &&
+        geometric_extract_draft_topk_cuda(proj_sg_.logits->data, n_tokens, vocab, K,
+                                top_log_probs.data(), top_token_ids.data(),
+                                temperature)) {
+        return true;
+    }
+#endif
+
     std::vector<float> logits((size_t)vocab * n_tokens);
     ggml_backend_tensor_get(proj_sg_.logits, logits.data(), 0,
                             sizeof(float) * (size_t)vocab * n_tokens);
-
-    top_log_probs.assign((size_t)n_tokens * K, 0.0f);
-    top_token_ids.assign((size_t)n_tokens * K, 0);
     extract_draft_topk(logits.data(), n_tokens, vocab, K,
                        top_log_probs.data(), top_token_ids.data(), temperature);
     return true;

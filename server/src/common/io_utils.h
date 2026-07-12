@@ -10,12 +10,15 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <climits>
+#include <cerrno>
 
 #if defined(_WIN32)
 #  ifndef NOMINMAX
 #    define NOMINMAX
 #  endif
 #  include <windows.h>
+#  include <io.h>
 #else
 #  include <cerrno>
 #  include <unistd.h>
@@ -94,32 +97,7 @@ static inline void stream_emit_fd(int stream_fd, int32_t tok) {
 #endif
 }
 
-#if defined(_WIN32)
-static inline bool read_exact_fd(int fd, void * data, size_t bytes) {
-    char * p = (char *)data;
-    size_t done = 0;
-    HANDLE h = (HANDLE)(intptr_t)fd;
-    while (done < bytes) {
-        DWORD n = 0;
-        DWORD to_read = (bytes - done > (size_t)(DWORD)-1) ? (DWORD)-1 : (DWORD)(bytes - done);
-        if (!ReadFile(h, p + done, to_read, &n, nullptr) || n == 0) return false;
-        done += (size_t)n;
-    }
-    return true;
-}
-static inline bool write_exact_fd(int fd, const void * data, size_t bytes) {
-    const char * p = (const char *)data;
-    size_t done = 0;
-    HANDLE h = (HANDLE)(intptr_t)fd;
-    while (done < bytes) {
-        DWORD n = 0;
-        DWORD to_write = (bytes - done > (size_t)(DWORD)-1) ? (DWORD)-1 : (DWORD)(bytes - done);
-        if (!WriteFile(h, p + done, to_write, &n, nullptr) || n == 0) return false;
-        done += (size_t)n;
-    }
-    return true;
-}
-#else
+#if !defined(_WIN32)
 static inline bool read_exact_fd(int fd, void * data, size_t bytes) {
     char * p = (char *)data;
     size_t done = 0;
@@ -140,6 +118,35 @@ static inline bool write_exact_fd(int fd, const void * data, size_t bytes) {
     size_t done = 0;
     while (done < bytes) {
         ssize_t n = ::write(fd, p + done, bytes - done);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        done += (size_t)n;
+    }
+    return true;
+}
+#else
+static inline bool read_exact_fd(int fd, void * data, size_t bytes) {
+    char * p = (char *)data;
+    size_t done = 0;
+    while (done < bytes) {
+        int n = _read(fd, p + done, (unsigned int)(bytes - done > UINT_MAX ? UINT_MAX : bytes - done));
+        if (n == 0) return false;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        done += (size_t)n;
+    }
+    return true;
+}
+
+static inline bool write_exact_fd(int fd, const void * data, size_t bytes) {
+    const char * p = (const char *)data;
+    size_t done = 0;
+    while (done < bytes) {
+        int n = _write(fd, p + done, (unsigned int)(bytes - done > UINT_MAX ? UINT_MAX : bytes - done));
         if (n < 0) {
             if (errno == EINTR) continue;
             return false;
